@@ -1,0 +1,31 @@
+name: USCIS Checker
+
+on:
+  schedule:
+    - cron: "7 7 * * *"   # una vez al día (07:07 UTC). Ajusta si quieres.
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Init project and install Playwright
+        run: |
+          npm init -y
+          npm install playwright@1.45.0
+          npx playwright install --with-deps chromium
+
+      - name: Run USCIS check
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          node ./scripts/uscis_check.js
