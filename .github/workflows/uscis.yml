@@ -1,27 +1,65 @@
 name: USCIS Checker
+
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "7 7 * * *"   # 1 vez al día a las 07:07 UTC
-  workflow_dispatch: {}
+    # Corre todos los días a las 02:00 UTC (ajusta si quieres otra hora)
+    - cron: '0 2 * * *'
+
+concurrency:
+  group: uscis-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  check:
+  run:
     runs-on: ubuntu-latest
+    env:
+      # Configúralos en GitHub → Settings → Secrets and variables → Actions → New repository secret
+      API_BASE: ${{ secrets.API_BASE }}   # ej: https://aroeservices.com  (SIN slash final)
+      API_TOKEN: ${{ secrets.API_TOKEN }} # ej: j7gHk9Lp3RzVbN4m
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Install Playwright
+      - name: Install dependencies (npm)
         run: |
-          npm init -y
-          npm install playwright@1.45.0
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
           npx playwright install --with-deps chromium
 
-      - name: Run USCIS check
-        env:
-          API_BASE: ${{ secrets.API_BASE }}
-          API_TOKEN: ${{ secrets.API_TOKEN }}
-        run: node ./scripts/uscis_check.cjs
+      - name: Sanity check API (queue)
+        id: sanity
+        shell: bash
+        run: |
+          set -e
+          echo "Consultando cola en $API_BASE ..."
+          RESP="$(curl -sS -H "Authorization: Bearer $API_TOKEN" -H "Accept: application/json" "$API_BASE/api/uscis/queue" || true)"
+          # Calcula el tamaño de la cola con Node (sin exponer el token)
+          COUNT="$(node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{const j=JSON.parse(d);console.log((j.queue||[]).length)}catch(e){console.log("INVALID")}})' <<< "$RESP")"
+          if [ "$COUNT" = "INVALID" ]; then
+            echo "Respuesta no válida de la API:"
+            echo "$RESP"
+            exit 1
+          fi
+          echo "Items en cola: $COUNT"
+          echo "queue_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Run USCIS checker
+        if: steps.sanity.outputs.queue_count != '0'
+        run: npm run uscis:check
+
+      - name: No hay items en cola
+        if: steps.sanity.outputs.queue_count == '0'
+        run: echo "Nada para hacer."
