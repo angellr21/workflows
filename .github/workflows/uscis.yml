@@ -3,31 +3,31 @@ name: uscis
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # cada 30 min
-
-permissions:
-  contents: read
+    - cron: '*/15 * * * *' # cada 15 minutos
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      API_BASE: ${{ secrets.API_BASE }}
+      API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Use Node.js 20
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
-      # ⚠️ NO ejecutamos `npm init -y` para no pisar tu package.json
+      # Instalamos Playwright sin inicializar proyecto (NO npm init)
       - name: Install Playwright
         run: |
-          npm i --no-save playwright@^1.46.0
+          npm i --no-save playwright@1.45.0
+          npx playwright install --with-deps chromium
 
       - name: Run USCIS check
-        env:
-          API_BASE: ${{ secrets.API_BASE }}   # p.ej. https://aroeservices.com/api
-          API_TOKEN: ${{ secrets.API_TOKEN }} # tu token guardado como secreto
         run: node ./scripts/uscis_check.cjs
