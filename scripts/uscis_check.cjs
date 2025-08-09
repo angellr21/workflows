@@ -1,84 +1,157 @@
-/* eslint-disable no-console */
+#!/usr/bin/env node
+
+/**
+ * USCIS checker (GitHub Actions)
+ * - Pide cola a tu API protegida
+ * - Hace scraping en egov.uscis.gov para cada receipt
+ * - Devuelve el HTML íntegro al endpoint /api/uscis/report
+ * Requiere:
+ *   - Node 20+ (tiene fetch nativo)
+ *   - Playwright (chromium)
+ *   - ENV: API_BASE, API_TOKEN
+ */
+
 const { chromium } = require('playwright');
 
-function stripTrailingSlashes(s) {
-  return (s || '').replace(/\/+$/, '');
-}
+const API_BASE  = process.env.API_BASE  || 'https://aroeservices.com';
+const API_TOKEN = process.env.API_TOKEN;
 
-async function main() {
-  const API_BASE_RAW = process.env.API_BASE || '';
-  const API_BASE = stripTrailingSlashes(API_BASE_RAW);
-  const API_TOKEN = process.env.API_TOKEN || '';
+function log(...a) { console.log(...a); }
 
-  if (!API_BASE || !API_TOKEN) {
-    console.error('Faltan variables de entorno: API_BASE y/o API_TOKEN.');
-    process.exit(1);
-  }
-
-  console.log('USCIS Actions: iniciando…');
-  console.log(`API_BASE: ${API_BASE}`);
-
-  // 1) Obtener cola
-  const qUrl = `${API_BASE}/uscis/queue`;
-  const qRes = await fetch(qUrl, {
+async function apiGet(path) {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: {
       'Authorization': `Bearer ${API_TOKEN}`,
-      'Accept': 'application/json',
-    },
+      'Accept': 'application/json'
+    }
   });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`GET ${path} -> ${res.status} ${res.statusText} ${txt}`);
+  }
+  return res.json();
+}
 
-  if (!qRes.ok) {
-    const body = await qRes.text().catch(() => '');
-    console.error(`GET /uscis/queue -> HTTP ${qRes.status}`);
-    console.error(body.slice(0, 400));
+async function apiPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST ${path} -> ${res.status} ${res.statusText} ${txt}`);
+  }
+  return res.json();
+}
+
+async function scrapeReceipt(page, receiptNumber) {
+  // Consulta directa por querystring (más estable que el formulario)
+  const url = `https://egov.uscis.gov/casestatus/mycasestatus.do?appReceiptNum=${encodeURIComponent(receiptNumber)}`;
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+
+  // Espera contenedor de estado o main; el sitio cambia clases a menudo
+  try {
+    await page.waitForSelector('#caseStatus, #formCaseStatus, main', { timeout: 30_000 });
+  } catch (_) { /* continuamos igual: devolveremos el HTML completo */ }
+
+  // Devolvemos TODO el HTML para que el backend lo parsee con su servicio
+  const html = await page.content();
+  return html;
+}
+
+(async () => {
+  log('USCIS Actions: iniciando…');
+
+  if (!API_TOKEN) {
+    console.error('Falta API_TOKEN en variables de entorno.');
     process.exit(1);
   }
 
-  const qJson = await qRes.json().catch(() => ({}));
-  const items = Array.isArray(qJson.queue) ? qJson.queue : [];
-  console.log(`Se recibieron ${items.length} item(s) para revisar.`);
+  // 1) Obtener cola
+  let data;
+  try {
+    data = await apiGet('/api/uscis/queue');
+  } catch (err) {
+    console.error('Error pidiendo cola:', err.message);
+    process.exit(1);
+  }
 
-  if (items.length === 0) {
-    console.log('Nada para hacer.');
+  // Compatibilidad con respuestas antiguas y nuevas:
+  // - nueva: { ok: true, count, items: [{ tramite_id, receipt_number }] }
+  // - antigua: { status:'ok', queue: [{ id, receipt_number, ... }] }
+  const items = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(data?.queue)
+      ? data.queue.map(x => ({
+          tramite_id: x.tramite_id ?? x.id ?? x.tramite ?? x.tramiteId ?? null,
+          receipt_number: x.receipt_number ?? x.receipt ?? x.number ?? null
+        }))
+      : [];
+
+  log(`Se recibieron ${items.length} item(s) para revisar.`);
+
+  if (!items.length) {
+    log('Nada para hacer.');
     return;
   }
 
-  // 2) (Demo) Solo mostramos qué revisaríamos.
-  //    Aquí iría tu scraping real y el POST al backend para guardar resultados.
-  //    Como en tu backend solo existe /uscis/queue, por ahora solo navega y lee la página.
-  const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
+  // 2) Scraping
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage']
+  });
 
-  for (const it of items) {
-    const rn = it.receipt_number;
-    console.log(`→ Revisando ${rn}…`);
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36'
+  });
 
-    // Abre la página de USCIS de status por número de recibo
-    // (No guardamos nada porque tu API aún no expone un endpoint de “guardar”.)
-    try {
-      await page.goto('https://egov.uscis.gov/casestatus/landing.do', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.fill('#receipt_number', rn);
-      await Promise.all([
-        page.click('button[type="submit"], #caseStatusSearchButton'),
-        page.waitForLoadState('domcontentloaded'),
-      ]);
+  const results = [];
 
-      // Intenta leer los bloques principales
-      const title = (await page.locator('#receipt_number+div h1, .rows.text-center h1, .appointment-sec h1').first().textContent().catch(() => '') || '').trim();
-      const details = (await page.locator('.text-center p, .rows p, .appt-sec p').allTextContents().catch(() => [])).join('\n').trim();
-      console.log(`   Título: ${title || '(no leído)'}`);
-      console.log(`   Detalle (primeros 200): ${(details || '').slice(0, 200)}`);
-    } catch (e) {
-      console.error(`   Error navegando para ${rn}:`, e.message);
+  try {
+    for (const item of items) {
+      const tramite_id     = item.tramite_id ?? item.id;
+      const receipt_number = item.receipt_number;
+
+      if (!tramite_id || !receipt_number) {
+        log('Item inválido (falta tramite_id o receipt_number):', JSON.stringify(item));
+        continue;
+      }
+
+      log(`→ ${receipt_number} (tramite ${tramite_id})`);
+
+      const page = await context.newPage();
+      try {
+        const html = await scrapeReceipt(page, receipt_number);
+        results.push({ tramite_id, html });
+        log(`  ✓ scrape OK (${html.length} bytes)`);
+      } catch (err) {
+        log(`  ✗ error scrape: ${err.message}`);
+      } finally {
+        await page.close().catch(() => {});
+      }
     }
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 
-  await browser.close();
-  console.log('Listo.');
-}
+  if (!results.length) {
+    log('No hay resultados para reportar.');
+    return;
+  }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+  // 3) Reportar HTMLs al backend para que parsee y actualice estados
+  try {
+    const resp = await apiPost('/api/uscis/report', { items: results });
+    log('Reporte enviado:', JSON.stringify(resp));
+  } catch (err) {
+    console.error('Error reportando resultados:', err.message);
+    process.exit(1);
+  }
+})();
