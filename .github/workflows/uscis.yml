@@ -1,19 +1,16 @@
-name: uscis
+name: USCIS check
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *' # cada 15 minutos
+    - cron: '*/15 * * * *'
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     env:
       API_BASE: ${{ secrets.API_BASE }}
       API_TOKEN: ${{ secrets.API_TOKEN }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,13 +18,31 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      # Instalamos Playwright sin inicializar proyecto (NO npm init)
       - name: Install Playwright
         run: |
-          npm i --no-save playwright@1.45.0
+          npm init -y
+          npm install playwright@1.45.0
           npx playwright install --with-deps chromium
 
-      - name: Run USCIS check
+      # ---------- DEBUG: imprime URL, status HTTP y el JSON recibido ----------
+      - name: Debug API (queue)
+        run: |
+          set -euo pipefail
+          echo "API_BASE=${API_BASE}"
+          URL="${API_BASE%/}/api/uscis/queue"
+          echo "URL=${URL}"
+          echo "----- HTTP -----"
+          curl -sS -i -H "Authorization: Bearer ${API_TOKEN}" -H "Accept: application/json" "$URL" | sed -n '1,20p'
+          echo "----- BODY -----"
+          RESPONSE=$(curl -sS -H "Authorization: Bearer ${API_TOKEN}" -H "Accept: application/json" "$URL")
+          echo "$RESPONSE" | node -e 'process.stdin.once("data",d=>{try{console.log(JSON.stringify(JSON.parse(d),null,2))}catch(e){console.log(String(d))}})'
+          COUNT=$(echo "$RESPONSE" | node -e 'process.stdin.once("data",d=>{try{let j=JSON.parse(d);console.log((j.queue||[]).length)}catch(e){console.log(0)}})')
+          echo "Items en cola: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::warning title=Queue vacía::El endpoint devolvió 0 items. Revisa API_BASE (no debe terminar en /api) y API_TOKEN."
+          fi
+
+      - name: Run USCIS check script
         run: node ./scripts/uscis_check.cjs
