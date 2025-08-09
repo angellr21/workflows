@@ -1,16 +1,19 @@
-name: USCIS check
+name: uscis
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: "*/15 * * * *" # cada 15 minutos
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       API_BASE: ${{ secrets.API_BASE }}
       API_TOKEN: ${{ secrets.API_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,31 +21,27 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
+      # Playwright si tu script lo necesita más adelante
       - name: Install Playwright
         run: |
-          npm init -y
-          npm install playwright@1.45.0
+          npm i --no-save playwright@1.45.0
           npx playwright install --with-deps chromium
 
-      # ---------- DEBUG: imprime URL, status HTTP y el JSON recibido ----------
-      - name: Debug API (queue)
+      # SMOKE TEST: comprueba que la URL y auth son correctos
+      - name: Smoke test API auth
         run: |
-          set -euo pipefail
-          echo "API_BASE=${API_BASE}"
           URL="${API_BASE%/}/api/uscis/queue"
-          echo "URL=${URL}"
-          echo "----- HTTP -----"
-          curl -sS -i -H "Authorization: Bearer ${API_TOKEN}" -H "Accept: application/json" "$URL" | sed -n '1,20p'
-          echo "----- BODY -----"
-          RESPONSE=$(curl -sS -H "Authorization: Bearer ${API_TOKEN}" -H "Accept: application/json" "$URL")
-          echo "$RESPONSE" | node -e 'process.stdin.once("data",d=>{try{console.log(JSON.stringify(JSON.parse(d),null,2))}catch(e){console.log(String(d))}})'
-          COUNT=$(echo "$RESPONSE" | node -e 'process.stdin.once("data",d=>{try{let j=JSON.parse(d);console.log((j.queue||[]).length)}catch(e){console.log(0)}})')
-          echo "Items en cola: $COUNT"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::warning title=Queue vacía::El endpoint devolvió 0 items. Revisa API_BASE (no debe terminar en /api) y API_TOKEN."
-          fi
+          echo "URL efectiva: $URL"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Accept: application/json" "$URL")
+          echo "HTTP code: $CODE"
+          echo "Preview JSON:"
+          curl -s \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Accept: application/json" "$URL" | head -c 400 || true
 
-      - name: Run USCIS check script
+      - name: Run USCIS check
         run: node ./scripts/uscis_check.cjs
