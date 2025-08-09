@@ -1,0 +1,19 @@
+{
+  "name": "aroeservices-uscis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runner de scraping USCIS para aroeservices.com",
+  "main": "scripts/uscis_check.cjs",
+  "scripts": {
+    "uscis:check": "node scripts/uscis_check.cjs",
+    "postinstall": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.46.0",
+    "dotenv": "^16.4.5",
+    "undici": "^6.19.8"
+  }
+}
