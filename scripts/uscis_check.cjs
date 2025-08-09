@@ -1,86 +1,84 @@
-// scripts/uscis_check.cjs
-const { chromium } = require('playwright'); // CommonJS
+/* eslint-disable no-console */
+const { chromium } = require('playwright');
 
-const API_BASE  = process.env.API_BASE;
-const API_TOKEN = process.env.API_TOKEN;
-
-if (!API_BASE || !API_TOKEN) {
-  console.error("Faltan variables API_BASE o API_TOKEN.");
-  process.exit(1);
+function stripTrailingSlashes(s) {
+  return (s || '').replace(/\/+$/, '');
 }
 
-async function fetchQueue() {
-  const res = await fetch(`${API_BASE}/api/uscis/queue`, {
-    headers: { 'Authorization': `Bearer ${API_TOKEN}` }
+async function main() {
+  const API_BASE_RAW = process.env.API_BASE || '';
+  const API_BASE = stripTrailingSlashes(API_BASE_RAW);
+  const API_TOKEN = process.env.API_TOKEN || '';
+
+  if (!API_BASE || !API_TOKEN) {
+    console.error('Faltan variables de entorno: API_BASE y/o API_TOKEN.');
+    process.exit(1);
+  }
+
+  console.log('USCIS Actions: iniciando…');
+  console.log(`API_BASE: ${API_BASE}`);
+
+  // 1) Obtener cola
+  const qUrl = `${API_BASE}/uscis/queue`;
+  const qRes = await fetch(qUrl, {
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Accept': 'application/json',
+    },
   });
-  if (!res.ok) throw new Error(`Queue error ${res.status}: ${await res.text()}`);
-  return res.json();
-}
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  if (!qRes.ok) {
+    const body = await qRes.text().catch(() => '');
+    console.error(`GET /uscis/queue -> HTTP ${qRes.status}`);
+    console.error(body.slice(0, 400));
+    process.exit(1);
+  }
 
-(async () => {
-  console.log("USCIS Actions: iniciando…");
-  const queue = await fetchQueue();
-  const items = (queue && queue.items) ? queue.items : [];
+  const qJson = await qRes.json().catch(() => ({}));
+  const items = Array.isArray(qJson.queue) ? qJson.queue : [];
   console.log(`Se recibieron ${items.length} item(s) para revisar.`);
-  if (items.length === 0) { console.log("Nada para hacer."); return; }
 
+  if (items.length === 0) {
+    console.log('Nada para hacer.');
+    return;
+  }
+
+  // 2) (Demo) Solo mostramos qué revisaríamos.
+  //    Aquí iría tu scraping real y el POST al backend para guardar resultados.
+  //    Como en tu backend solo existe /uscis/queue, por ahora solo navega y lee la página.
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    locale: 'en-US',
-  });
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
 
-  const results = [];
   for (const it of items) {
-    const page = await context.newPage();
+    const rn = it.receipt_number;
+    console.log(`→ Revisando ${rn}…`);
+
+    // Abre la página de USCIS de status por número de recibo
+    // (No guardamos nada porque tu API aún no expone un endpoint de “guardar”.)
     try {
-      await page.goto('https://egov.uscis.gov/casestatus/landing.do', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(700 + Math.random()*900);
+      await page.goto('https://egov.uscis.gov/casestatus/landing.do', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.fill('#receipt_number', rn);
+      await Promise.all([
+        page.click('button[type="submit"], #caseStatusSearchButton'),
+        page.waitForLoadState('domcontentloaded'),
+      ]);
 
-      const url = `https://egov.uscis.gov/casestatus/mycasestatus.do?appReceiptNum=${encodeURIComponent(it.receipt_number)}&initCaseSearch=CHECK+STATUS`;
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 });
-
-      const html = await page.content();
-
-      results.push({
-        tramite_id: it.tramite_id,
-        receipt_number: it.receipt_number,
-        html,
-        fetched_at: new Date().toISOString(),
-      });
-
-      console.log(`OK: ${it.receipt_number}`);
-    } catch (err) {
-      console.error(`Fallo ${it.receipt_number}: ${err.message}`);
-      results.push({
-        tramite_id: it.tramite_id,
-        receipt_number: it.receipt_number,
-        html: '',
-        fetched_at: new Date().toISOString(),
-      });
-    } finally {
-      await page.close();
-      await sleep(900 + Math.random()*1300);
+      // Intenta leer los bloques principales
+      const title = (await page.locator('#receipt_number+div h1, .rows.text-center h1, .appointment-sec h1').first().textContent().catch(() => '') || '').trim();
+      const details = (await page.locator('.text-center p, .rows p, .appt-sec p').allTextContents().catch(() => [])).join('\n').trim();
+      console.log(`   Título: ${title || '(no leído)'}`);
+      console.log(`   Detalle (primeros 200): ${(details || '').slice(0, 200)}`);
+    } catch (e) {
+      console.error(`   Error navegando para ${rn}:`, e.message);
     }
   }
 
   await browser.close();
+  console.log('Listo.');
+}
 
-  const resp = await fetch(`${API_BASE}/api/uscis/report`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${API_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ items: results }),
-  });
-  if (!resp.ok) throw new Error(`Report error ${resp.status}: ${await resp.text()}`);
-  const j = await resp.json();
-  console.log("Reporte enviado:", j);
-  console.log("USCIS Actions: fin.");
-})().catch(err => {
-  console.error("Proceso falló:", err);
+main().catch((e) => {
+  console.error(e);
   process.exit(1);
 });
