@@ -1,41 +1,42 @@
-name: uscis
+name: USCIS Check
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"   # cada 15 minutos (ajusta si lo deseas)
+  workflow_dispatch: {}
 
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    env:
+      API_BASE: ${{ secrets.API_BASE }}
+      API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
-      - name: Checkout
+      - name: Run actions/checkout@v4
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Run actions/setup-node@v4
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Paso de depuración: imprime cómo queda la URL y hace una request de prueba
-      - name: Debug API URL + quick request
-        env:
-          API_BASE: ${{ secrets.API_BASE }}
-          API_TOKEN: ${{ secrets.API_TOKEN }}
+      - name: Echo base y probar /queue rápidamente
         run: |
           echo "RAW_API_BASE=$API_BASE"
           node -e "let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); console.log('NORMALIZED_API_BASE='+b); console.log('TEST_URL='+b+'/queue')"
           node -e "const https=require('node:https'); let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); let u=b+'/queue'; const opt=new URL(u); opt.headers={'Accept':'application/json','Authorization':'Bearer '+process.env.API_TOKEN}; https.get(opt,(res)=>{console.log('TEST_STATUS',res.statusCode); let d=''; res.on('data',c=>d+=c); res.on('end',()=>console.log((d||'').slice(0,500)));}).on('error',e=>console.error('TEST_ERR',e.message)); setTimeout(()=>{},1500);"
 
-      - name: Install Playwright
+      - name: Instalar Playwright (Chromium) y deps
         run: |
           npm init -y
-          npm install playwright@1.45.0
           npx playwright install --with-deps chromium
 
-      - name: Run checker
+      - name: Ejecutar USCIS check (headless)
         env:
           API_BASE: ${{ secrets.API_BASE }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
-        run: node ./scripts/uscis_check.cjs
+        run: |
+          node ./scripts/uscis_check.cjs
