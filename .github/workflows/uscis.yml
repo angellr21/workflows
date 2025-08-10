@@ -3,16 +3,11 @@ name: uscis
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *" # cada 15 minutos
+    - cron: "*/30 * * * *"
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      API_BASE: ${{ secrets.API_BASE }}
-      API_TOKEN: ${{ secrets.API_TOKEN }}
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -21,27 +16,26 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      # Playwright si tu script lo necesita más adelante
+      # Paso de depuración: imprime cómo queda la URL y hace una request de prueba
+      - name: Debug API URL + quick request
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          echo "RAW_API_BASE=$API_BASE"
+          node -e "let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); console.log('NORMALIZED_API_BASE='+b); console.log('TEST_URL='+b+'/queue')"
+          node -e "const https=require('node:https'); let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); let u=b+'/queue'; const opt=new URL(u); opt.headers={'Accept':'application/json','Authorization':'Bearer '+process.env.API_TOKEN}; https.get(opt,(res)=>{console.log('TEST_STATUS',res.statusCode); let d=''; res.on('data',c=>d+=c); res.on('end',()=>console.log((d||'').slice(0,500)));}).on('error',e=>console.error('TEST_ERR',e.message)); setTimeout(()=>{},1500);"
+
       - name: Install Playwright
         run: |
-          npm i --no-save playwright@1.45.0
+          npm init -y
+          npm install playwright@1.45.0
           npx playwright install --with-deps chromium
 
-      # SMOKE TEST: comprueba que la URL y auth son correctos
-      - name: Smoke test API auth
-        run: |
-          URL="${API_BASE%/}/api/uscis/queue"
-          echo "URL efectiva: $URL"
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $API_TOKEN" \
-            -H "Accept: application/json" "$URL")
-          echo "HTTP code: $CODE"
-          echo "Preview JSON:"
-          curl -s \
-            -H "Authorization: Bearer $API_TOKEN" \
-            -H "Accept: application/json" "$URL" | head -c 400 || true
-
-      - name: Run USCIS check
+      - name: Run checker
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
         run: node ./scripts/uscis_check.cjs
