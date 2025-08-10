@@ -1,33 +1,26 @@
 #!/usr/bin/env node
 /**
- * USCIS Checker — sin dependencias externas (usa fetch nativo de Node 18+)
- * Requisitos en el runner:
- *  - Node 18+ (el workflow usa Node 20)
- *  - Playwright instalado con Chromium (el workflow lo instala)
- * Entradas:
- *  - API_BASE (secreto): base del API, p.ej. https://aroeservices.com/api/uscis
- *  - API_TOKEN (secreto): token Bearer para autorización
+ * USCIS Checker — sin dependencias externas (fetch nativo de Node 18+ y Playwright)
  *
  * Flujo:
- *  1) GET  {API_BASE}/queue      -> obtiene items {tramite_id, receipt_number}
- *  2) Navega a USCIS y genera HTML del resultado para cada receipt
- *  3) POST {API_BASE}/report     -> envía [{tramite_id, html}]
+ *  1) GET  {API_BASE}/queue      -> { queue: [{ tramite_id|id, receipt_number }, ...] }
+ *  2) Playwright (headless) visita USCIS, rellena receipt y obtiene HTML del resultado
+ *  3) POST {API_BASE}/report     -> { items: [{ tramite_id, html }, ...] }
  */
 
 const { chromium } = require('playwright');
 
 function normalizeBase(u) {
   let b = String(u || '').trim();
-  b = b.replace(/[?#].*$/, '');   // quita query/fragment
-  b = b.replace(/\/+$/, '');      // quita trailing slash
-  b = b.replace(/\/queue$/i, ''); // por si pasan /queue por error
+  b = b.replace(/[?#].*$/, '');
+  b = b.replace(/\/+$/, '');
+  b = b.replace(/\/queue$/i, '');
   return b;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(...a);
 
-/** Pequeña redacción del dominio al imprimir (evita mostrar secretos en claro) */
 function redact(url) {
   try {
     const u = new URL(url);
@@ -37,6 +30,16 @@ function redact(url) {
   } catch {
     return String(url).replace(/.{4}$/, '****');
   }
+}
+
+async function clickIfExists(locator, timeout = 2000) {
+  try {
+    if (await locator.first().isVisible({ timeout })) {
+      await locator.first().click({ timeout });
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 (async () => {
@@ -79,14 +82,20 @@ function redact(url) {
 
   const queue = Array.isArray(queueJson?.queue) ? queueJson.queue : [];
   log(`Se recibieron ${queue.length} item(s) para revisar.`);
-
   if (!queue.length) {
     log('Nada para hacer.');
     process.exit(0);
   }
 
-  // Lanzar navegador headless
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+    ],
+  });
+
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
@@ -95,59 +104,212 @@ function redact(url) {
 
   const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing.do';
 
+  async function acceptBanners(pageOrFrame) {
+    // Varios candidatos comunes (OneTrust / cookie banners / consent)
+    const candidates = [
+      '#onetrust-accept-btn-handler',
+      'button#onetrust-accept-btn-handler',
+      'button:has-text("Accept All")',
+      'button:has-text("Accept all")',
+      'button:has-text("I Agree")',
+      'button:has-text("Got it")',
+      'button:has-text("Entiendo")',
+      'button:has-text("Aceptar")',
+      '[aria-label="accept cookies"]',
+      'button[title*="Accept"]',
+    ];
+    for (const sel of candidates) {
+      try {
+        const loc = pageOrFrame.locator(sel);
+        if (await loc.first().isVisible({ timeout: 1000 })) {
+          await loc.first().click({ timeout: 1500 });
+          await sleep(500);
+        }
+      } catch {}
+    }
+  }
+
+  async function findReceiptInputIn(frame) {
+    // Intentar múltiples selectores para robustez
+    const selectors = [
+      'input[name="appReceiptNum"]',
+      '#appReceiptNum',
+      'input[name="receipt_number"]',
+      '#receipt_number',
+      '#receiptNum',
+      'input#caseReceiptNumber',
+      'input[aria-label*="receipt" i]',
+      'input[placeholder*="receipt" i]',
+      'input[placeholder*="número de recibo" i]',
+      'input[type="text"]',
+    ];
+    for (const s of selectors) {
+      const el = frame.locator(s).first();
+      try {
+        await el.waitFor({ state: 'visible', timeout: 1000 });
+        return el;
+      } catch {}
+    }
+    // Buscar por label cercano
+    const labels = [
+      'Enter your receipt number',
+      'Ingrese su número de recibo',
+      'Receipt Number',
+      'Número de recibo',
+    ];
+    for (const text of labels) {
+      const el = frame.getByLabel(new RegExp(text, 'i')).first();
+      try {
+        await el.waitFor({ state: 'visible', timeout: 1000 });
+        return el;
+      } catch {}
+    }
+    return null;
+  }
+
+  async function findSubmitIn(frame) {
+    const candidates = [
+      'input[type="submit"][value*="Check" i]',
+      'button[type="submit"]',
+      '#caseStatusSearch, #caseStatusButton, #allFormSubmitButton',
+      'input[type="submit"]',
+      'button:has-text("Check Status")',
+      'button:has-text("Consultar")',
+    ];
+    for (const s of candidates) {
+      const el = frame.locator(s).first();
+      try {
+        if (await el.isVisible({ timeout: 800 })) return el;
+      } catch {}
+    }
+    // Rol accesible como fallback
+    try {
+      const el = frame.getByRole('button', { name: /check|status|consultar/i }).first();
+      if (await el.isVisible({ timeout: 800 })) return el;
+    } catch {}
+    return null;
+  }
+
+  async function dumpFrames(page) {
+    try {
+      const frames = page.frames();
+      console.log(`DEBUG: Hay ${frames.length} frame(s)`);
+      frames.forEach((f, i) => {
+        try { console.log(`  [${i}] url=${f.url()}`); } catch {}
+      });
+    } catch {}
+  }
+
   async function fetchCaseHtml(receipt) {
     const page = await context.newPage();
     try {
       await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await acceptBanners(page);
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await sleep(800);
 
-      // Campo probable (pueden variar IDs/names)
-      const inputSel = 'input[name="appReceiptNum"], #receipt_number, #receiptNum';
-      await page.waitForSelector(inputSel, { timeout: 30000 });
-      await page.fill(inputSel, receipt);
+      // Si existen iframes, intentar dentro de cada uno
+      await dumpFrames(page);
+      const frames = page.frames();
 
-      // Intentar diferentes botones
-      const btnSelectors = [
-        'input[type="submit"][value*="Check"]',
-        'button[type="submit"]',
-        '#caseStatusSearch, #caseStatusButton, #allFormSubmitButton',
-        'input[type="submit"]',
-      ];
+      // Primero intentar en la página principal
+      let input = await findReceiptInputIn(page);
+      let submitBtn = null;
 
-      let clicked = false;
-      for (const sel of btnSelectors) {
-        const exists = await page.$(sel);
-        if (exists) {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {}),
-            page.click(sel).catch(() => {}),
-          ]);
-          clicked = true;
-          break;
+      if (!input) {
+        // Intentar en iframes
+        for (const f of frames) {
+          try {
+            await acceptBanners(f);
+            input = await findReceiptInputIn(f);
+            if (input) {
+              submitBtn = await findSubmitIn(f);
+              break;
+            }
+          } catch {}
         }
+      } else {
+        submitBtn = await findSubmitIn(page);
       }
-      if (!clicked) throw new Error('No se encontró el botón de "Check Status".');
 
-      // Esperar resultados (varios selectores candidatos)
+      if (!input) {
+        // Logs de ayuda
+        const content = await page.content();
+        console.log('DEBUG: No se encontró input. HTML (primeros 1200 chars):');
+        console.log(content.slice(0, 1200));
+        throw new Error('No se encontró el campo de Receipt Number (cambio de DOM o bloqueo).');
+      }
+
+      await input.fill(receipt, { timeout: 5000 });
+      await sleep(300);
+
+      if (!submitBtn) {
+        // buscar el submit en el mismo frame del input
+        const ownerFrame = input.page() || page;
+        submitBtn = await findSubmitIn(ownerFrame);
+      }
+      if (!submitBtn) {
+        throw new Error('No se encontró el botón de "Check Status".');
+      }
+
+      await Promise.all([
+        input.page().waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {}),
+        submitBtn.click().catch(() => {}),
+      ]);
+
+      // Esperar resultados
       const resultSelectors = [
         '#caseStatus',
         '.rows.text-center',
         '.appointment-sec',
         '.content',
         'main',
+        '#caseStatusText',
+        'section:has(h1), section:has(h2)',
       ];
-      await page.waitForSelector(resultSelectors.join(', '), { timeout: 60000 });
 
-      // Intentar extraer fragmento significativo primero
-      for (const sel of resultSelectors) {
-        const el = await page.$(sel);
-        if (el) {
-          const html = await el.evaluate((node) => node.outerHTML);
-          if (html && html.trim().length > 200) return html;
+      // Probar en main y frames
+      let resultHtml = null;
+      // Primero revisar main
+      try {
+        await page.waitForSelector(resultSelectors.join(', '), { timeout: 15000 });
+        for (const sel of resultSelectors) {
+          const el = await page.$(sel);
+          if (el) {
+            const html = await el.evaluate((n) => n.outerHTML);
+            if (html && html.trim().length > 200) {
+              resultHtml = html;
+              break;
+            }
+          }
+        }
+      } catch {}
+
+      if (!resultHtml) {
+        // Probar en frames
+        for (const f of page.frames()) {
+          try {
+            await f.waitForSelector(resultSelectors.join(', '), { timeout: 8000 });
+            for (const sel of resultSelectors) {
+              const el = await f.$(sel);
+              if (el) {
+                const html = await el.evaluate((n) => n.outerHTML);
+                if (html && html.trim().length > 200) {
+                  resultHtml = html;
+                  break;
+                }
+              }
+            }
+            if (resultHtml) break;
+          } catch {}
         }
       }
 
-      // Si no, devolver toda la página
-      return await page.content();
+      if (!resultHtml) {
+        // Como último recurso, devolver toda la página
+        return await page.content();
+      }
+      return resultHtml;
     } finally {
       await page.close().catch(() => {});
     }
@@ -156,7 +318,6 @@ function redact(url) {
   const itemsForReport = [];
   for (const it of queue) {
     const receipt = String(it.receipt_number || '').trim();
-    // el backend acepta tramite_id (preferente) o id según tu implementación
     const tramiteId = it.tramite_id ?? it.id;
 
     if (!receipt || !tramiteId) {
@@ -167,12 +328,9 @@ function redact(url) {
     log('• Pendiente:', receipt);
 
     try {
-      // Pequeño jitter para no machacar
-      await sleep(1000 + Math.floor(Math.random() * 500));
-
+      await sleep(1000 + Math.floor(Math.random() * 700));
       const html = await fetchCaseHtml(receipt);
       if (!html || html.length < 200) throw new Error('HTML de resultado demasiado corto.');
-
       itemsForReport.push({ tramite_id: tramiteId, html });
     } catch (err) {
       console.error(`✗ Error con ${receipt}:`, err.message);
@@ -201,11 +359,7 @@ function redact(url) {
 
     const bodyText = await res.text().catch(() => '');
     let bodyJson = null;
-    try {
-      bodyJson = JSON.parse(bodyText);
-    } catch {
-      // puede no ser JSON
-    }
+    try { bodyJson = JSON.parse(bodyText); } catch {}
 
     if (!res.ok) throw new Error(`Report HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
     log('Reporte enviado. Respuesta:', bodyJson ? JSON.stringify(bodyJson).slice(0, 500) : bodyText.slice(0, 500));
