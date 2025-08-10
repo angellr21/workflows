@@ -37,12 +37,12 @@ jobs:
           npm install playwright@1.45.0
           npx playwright install --with-deps chromium
 
-      # *** Paso de debug: mostrar exactamente el script que se ejecutará ***
+      # Debug: mostrar el script que se ejecutará
       - name: Mostrar script que se va a ejecutar (debug)
         shell: bash
         run: |
           echo "=== scripts/uscis_check.cjs (head) ==="
-          sed -n '1,200p' scripts/uscis_check.cjs
+          sed -n '1,220p' scripts/uscis_check.cjs
           echo "=== EOF (head) ==="
 
       - name: Ejecutar USCIS check (headless)
