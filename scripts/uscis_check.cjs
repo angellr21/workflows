@@ -23,26 +23,22 @@ function clip(text, max = 800) {
 function normalizeBase(raw) {
   let b = String(raw || "").trim();
 
-  // Quitar espacios y query/fragments accidentales
+  // quitar query/fragment
   b = b.replace(/[?#].*$/, "");
-
-  // Quitar slash(es) finales
+  // quitar slash(es) finales
   b = b.replace(/\/+$/, "");
-
-  // Si el usuario pegó la ruta completa con /queue, quítalo
+  // si vino con /queue pegado, quitarlo
   b = b.replace(/\/queue$/i, "");
 
-  // Seguridad básica: debe empezar por http
   if (!/^https?:\/\//i.test(b)) {
     throw new Error(
       `API_BASE inválido: "${raw}". Debe incluir el esquema (https://).`
     );
   }
-
   return b;
 }
 
-/** Hace GET al endpoint de queue y devuelve JSON */
+/** GET al endpoint de queue y devuelve JSON */
 async function fetchQueue(apiBase, token) {
   const url = `${apiBase}/queue`;
   console.log(`URL de cola: ${url}`);
@@ -74,14 +70,15 @@ async function fetchQueue(apiBase, token) {
     }
   }
 
-  // Normalizar base y token
-  const apiBase = normalizeBase(process.env.API_BASE);
+  const rawBase = process.env.API_BASE;
+  const apiBase = normalizeBase(rawBase);
   const token = String(process.env.API_TOKEN).trim();
 
-  // Traer cola
+  console.log(`API_BASE (raw): ${rawBase}`);
+  console.log(`API_BASE (normalizada): ${apiBase}`);
+
   const data = await fetchQueue(apiBase, token);
 
-  // Esperamos forma: { status: "ok", queue: [...] }
   const queue = Array.isArray(data?.queue) ? data.queue : [];
   console.log(`Se recibieron ${queue.length} item(s) para revisar.`);
 
@@ -90,16 +87,17 @@ async function fetchQueue(apiBase, token) {
     process.exit(0);
   }
 
-  // Aquí iría el procesamiento de cada item (scraping/actualización).
-  // Por ahora, solo listamos los receipt_number para depurar.
   for (const it of queue) {
     const rn = it?.receipt_number ?? "(sin receipt_number)";
     console.log(`• Pendiente: ${rn}`);
   }
 
-  // Si llegó aquí, la cola se leyó correctamente.
   process.exit(0);
 })().catch((err) => {
-  console.error(`Proceso falló: ${err instanceof Error ? err.stack || err.message : String(err)}`);
+  console.error(
+    `Proceso falló: ${
+      err instanceof Error ? err.stack || err.message : String(err)
+    }`
+  );
   process.exit(1);
 });
