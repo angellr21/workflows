@@ -1,314 +1,216 @@
 #!/usr/bin/env node
-
 /**
- * USCIS case status checker
- * - Headless 100%
- * - Respeta backoff/jitter para evitar bloqueos
- * - Envía resultados por webhook a tu API Laravel
- *
- * Requiere:
- *   - process.env.API_BASE (p.ej. https://aroeservices.com/api/uscis)
- *   - process.env.API_TOKEN (Bearer)
+ * USCIS Checker (Opción B) — sin dependencias externas (usa fetch nativo de Node 18+)
  *
  * Flujo:
- *   1) GET {API_BASE}/queue  -> { status: "ok", queue: [{receipt_number, id, ...}, ...] }
- *   2) Por cada item:
- *        - Navegar a https://egov.uscis.gov/casestatus/landing.do
- *        - Ingresar número y consultar
- *        - Parsear título y cuerpo del estado
- *        - POST {API_BASE}/webhook/status  (Authorization: Bearer <token>)
- *        - Esperar con jitter antes del siguiente ítem
+ * 1) Lee API_BASE y API_TOKEN desde env.
+ * 2) GET {API_BASE}/queue  -> obtiene { status:"ok", queue:[ { tramite_id, receipt_number, ... } ] }
+ * 3) Por cada item: abre USCIS, consulta el receipt y obtiene el HTML de resultado.
+ * 4) POST {API_BASE}/report con { items: [ { tramite_id, html } ] }
+ * 5) Log estructurado para CI.
  */
 
-const { chromium, devices } = require('playwright');
-const fetch = require('node-fetch');
+const { chromium } = require('playwright'); // Playwright viene por acciones previas del workflow
 
-// ---------- Utilidades ----------
+// Utilidad: normalizar base URL
+function normalizeBase(u) {
+  let b = String(u || '').trim();
+  b = b.replace(/[?#].*$/, '');      // quita query/fragment
+  b = b.replace(/\/+$/, '');         // quita trailing slash
+  b = b.replace(/\/queue$/i, '');    // por si mandan .../queue
+  return b;
+}
+
+// Pequeños helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const jitter = (minMs, maxMs) =>
-  Math.floor(minMs + Math.random() * (maxMs - minMs));
+const log = (...a) => console.log(...a);
 
-function normalizeBaseUrl(raw) {
-  if (!raw) return '';
-  let url = String(raw).trim();
-  url = url.replace(/\/+$/g, ''); // sin trailing slash
-  return url;
-}
-
-async function httpJson(url, options = {}) {
-  const res = await fetch(url, options);
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return { ok: res.ok, status: res.status, json, text };
-}
-
-function log(...args) {
-  const stamp = new Date().toISOString();
-  console.log(`[${stamp}]`, ...args);
-}
-
-// ---------- Config ----------
-const RAW_API_BASE = process.env.API_BASE || '';
-const API_BASE = normalizeBaseUrl(RAW_API_BASE);
-const API_TOKEN = process.env.API_TOKEN || '';
-
-if (!API_BASE || !API_TOKEN) {
-  console.error('Faltan variables de entorno API_BASE y/o API_TOKEN');
-  process.exit(2);
-}
-
-// Frecuencia/espaciado recomendado (anti-bloqueos):
-// - Jitter entre ítems: 8–18s
-// - Random UA/viewport
-const PER_ITEM_MIN_WAIT_MS = 8000;
-const PER_ITEM_MAX_WAIT_MS = 18000;
-
-// Navegación USCIS
-const USCIS_LANDING = 'https://egov.uscis.gov/casestatus/landing.do';
-
-// Algunos selectores conocidos (con fallback)
-const SELECTORS = {
-  input: ['#receipt_number', 'input[name="appReceiptNum"]', 'input#receipt_number'],
-  submit: ['input[type="submit"]', 'button[type="submit"]', 'button:has-text("Check Status")', 'input#caseStatusSearch'],
-  statusTitle: [
-    'h1',
-    '.current-status h1',
-    '#formCaseStatus h1',
-    '.rows.text-center h1',
-  ],
-  statusBody: [
-    '.appointment-sec p',
-    '#casestatus p',
-    '.rows.text-center p',
-    'p',
-  ],
-  captcha: ['iframe[src*="recaptcha"]', 'div.g-recaptcha', 'iframe[title*="challenge"]'],
-};
-
-async function tryFillAndSubmit(page, receipt) {
-  // Esperas y fallbacks para el input
-  let inputEl = null;
-  for (const sel of SELECTORS.input) {
-    try {
-      inputEl = await page.waitForSelector(sel, { timeout: 4000 });
-      if (inputEl) break;
-    } catch (_) {}
-  }
-  if (!inputEl) throw new Error('No encontré el input del número de recibo.');
-
-  await inputEl.click({ delay: 50 });
-  await inputEl.fill('');
-  await inputEl.type(receipt, { delay: 40 });
-
-  // Intentar enviar
-  for (const sel of SELECTORS.submit) {
-    try {
-      const btn = await page.$(sel);
-      if (btn) {
-        await Promise.all([
-          page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}),
-          btn.click({ delay: 60 }),
-        ]);
-        return;
-      }
-    } catch (_) {}
-  }
-
-  // Fallback: Enter
-  await inputEl.press('Enter');
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-}
-
-async function anySelector(page, arr) {
-  for (const s of arr) {
-    const el = await page.$(s);
-    if (el) return el;
-  }
-  return null;
-}
-
-async function getInnerText(el) {
-  if (!el) return '';
-  const txt = (await el.innerText()).trim();
-  return txt.replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
-}
-
-async function looksLikeCaptcha(page) {
-  // Si aparece un recaptcha/challenge, devolvemos true
-  for (const sel of SELECTORS.captcha) {
-    const has = await page.$(sel);
-    if (has) return true;
-  }
-  // También si no aparece ningún contenedor de resultados tras enviar
-  const h1 = await anySelector(page, SELECTORS.statusTitle);
-  const p = await anySelector(page, SELECTORS.statusBody);
-  if (!h1 && !p) {
-    // Puede ser que USCIS cambió, pero también puede ser challenge.
-    // Dejamos como "posible captcha".
-    return false; // conservador
-  }
-  return false;
-}
-
-async function scrapeOne(browser, receipt) {
-  const context = await browser.newContext({
-    userAgent: devices['Desktop Chrome HiDPI'].userAgent.replace('Headless', ''),
-    viewport: { width: 1280 + Math.floor(Math.random() * 240), height: 900 + Math.floor(Math.random() * 200) },
-    locale: 'en-US',
-  });
-  const page = await context.newPage();
-
-  try {
-    // Jitter inicial por item
-    await sleep(jitter(1500, 4000));
-
-    await page.goto(USCIS_LANDING, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-    await tryFillAndSubmit(page, receipt);
-
-    // Esperar contenido
-    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-    if (await looksLikeCaptcha(page)) {
-      throw new Error('Captcha o challenge detectado; no se pudo continuar.');
-    }
-
-    const titleEl = await anySelector(page, SELECTORS.statusTitle);
-    const bodyEl = await anySelector(page, SELECTORS.statusBody);
-
-    const status_title = await getInnerText(titleEl);
-    const status_body = await getInnerText(bodyEl);
-
-    if (!status_title && !status_body) {
-      throw new Error('No se pudo extraer el estado (selectores vacíos).');
-    }
-
-    return {
-      ok: true,
-      receipt_number: receipt,
-      status_title,
-      status_body,
-      checked_at: new Date().toISOString(),
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      receipt_number: receipt,
-      error: err?.message || String(err),
-      checked_at: new Date().toISOString(),
-    };
-  } finally {
-    await page.close().catch(() => {});
-    await context.close().catch(() => {});
-  }
-}
-
-async function run() {
+(async () => {
   log('USCIS Actions: iniciando…');
-  log('API_BASE (normalizada):', API_BASE);
 
-  // 1) Obtener cola
-  const queueUrl = `${API_BASE}/queue`;
-  const q = await httpJson(queueUrl, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      Accept: 'application/json',
-      'User-Agent': 'uscis-actions/1.0 (+github-actions)',
-    },
-  });
+  // 1) ENV
+  const RAW_API_BASE = process.env.API_BASE || '';
+  const API_TOKEN = process.env.API_TOKEN || '';
+  const API_BASE = normalizeBase(RAW_API_BASE);
 
-  if (!q.ok) {
-    console.error('No se pudo obtener la cola:', q.status, q.text);
+  if (!API_BASE) {
+    console.error('ERROR: API_BASE no definido.');
     process.exit(1);
   }
-  const items = Array.isArray(q.json?.queue) ? q.json.queue : [];
-  log(`Se recibieron ${items.length} item(s) para revisar.`);
+  if (!API_TOKEN) {
+    console.error('ERROR: API_TOKEN no definido.');
+    process.exit(1);
+  }
 
-  if (items.length === 0) {
+  log('API_BASE (raw):', RAW_API_BASE.replace(/.{4}$/,'****'));
+  log('API_BASE (normalizada):', API_BASE.replace(/.{4}$/,'****'));
+
+  // 2) Traer cola
+  const queueUrl = `${API_BASE}/queue`;
+  log('URL de cola:', queueUrl.replace(/.{4}$/,'****'));
+
+  let queueJson;
+  try {
+    const res = await fetch(queueUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${API_TOKEN}`,
+      },
+    });
+    if (!res.ok) {
+      throw new Error(`Queue HTTP ${res.status}`);
+    }
+    queueJson = await res.json();
+  } catch (err) {
+    console.error('ERROR al pedir cola:', err.message);
+    process.exit(1);
+  }
+
+  const queue = Array.isArray(queueJson?.queue) ? queueJson.queue : [];
+  log(`Se recibieron ${queue.length} item(s) para revisar.`);
+
+  if (!queue.length) {
     log('Nada para hacer.');
-    return;
+    process.exit(0);
   }
 
-  for (const it of items) {
-    log('• Pendiente:', it.receipt_number);
-  }
-
-  // 2) Scraping headless
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-    ],
+  // 3) Playwright (headless 100%)
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+    viewport: { width: 1366, height: 900 },
   });
 
-  try {
-    for (let idx = 0; idx < items.length; idx++) {
-      const { receipt_number } = items[idx];
-      const res = await scrapeOne(browser, receipt_number);
+  const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing.do';
 
-      // 3) Enviar webhook con resultado
-      const hookUrl = `${API_BASE}/webhook/status`;
-      const payload = res.ok
-        ? {
-            receipt_number: res.receipt_number,
-            status_title: res.status_title,
-            status_body: res.status_body,
-            checked_at: res.checked_at,
-            ok: true,
-          }
-        : {
-            receipt_number: res.receipt_number,
-            error: res.error,
-            checked_at: res.checked_at,
-            ok: false,
-          };
+  // Función: consultar un receipt y devolver HTML de resultado
+  async function fetchCaseHtml(receipt) {
+    const page = await context.newPage();
+    try {
+      await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-      const post = await httpJson(hookUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${API_TOKEN}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'uscis-actions/1.0 (+github-actions)',
-        },
-        body: JSON.stringify(payload),
-      });
+      // Campo de receipt
+      const inputSel = 'input[name="appReceiptNum"], #receipt_number, #receiptNum';
+      await page.waitForSelector(inputSel, { timeout: 30000 });
+      await page.fill(inputSel, receipt);
 
-      if (!post.ok) {
-        console.error(
-          `Webhook error (${receipt_number}):`,
-          post.status,
-          post.text
-        );
-      } else {
-        log(`Webhook OK (${receipt_number})`);
+      // Botón "Check Status" (varía con cambios de USCIS; probamos varios)
+      const btnSelectors = [
+        'input[type="submit"][value*="Check"]',
+        'button[type="submit"]',
+        '#caseStatusSearch, #caseStatusButton, #allFormSubmitButton',
+        'input[type="submit"]',
+      ];
+      let clicked = false;
+      for (const sel of btnSelectors) {
+        const exists = await page.$(sel);
+        if (exists) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{}),
+            page.click(sel).catch(()=>{}),
+          ]);
+          clicked = true;
+          break;
+        }
+      }
+      if (!clicked) {
+        throw new Error('No se encontró el botón de "Check Status".');
       }
 
-      // Anti-bloqueos: jitter entre ítems
-      if (idx < items.length - 1) {
-        const wait = jitter(PER_ITEM_MIN_WAIT_MS, PER_ITEM_MAX_WAIT_MS);
-        log(`Esperando ${Math.round(wait / 1000)}s antes del siguiente…`);
-        await sleep(wait);
+      // Esperar contenido del resultado; probamos varios contenedores típicos
+      const resultSelectors = [
+        '#caseStatus',               // container general
+        '.rows.text-center',         // muy común
+        '.appointment-sec',          // fallback
+        '.content',                  // fallback genérico
+        'main',                      // último recurso
+      ];
+      await page.waitForSelector(resultSelectors.join(', '), { timeout: 60000 });
+
+      // Capturamos el HTML de la sección principal si existe; si no, toda la página
+      for (const sel of resultSelectors) {
+        const el = await page.$(sel);
+        if (el) {
+          const html = await el.evaluate((node) => node.outerHTML);
+          if (html && html.trim().length > 200) return html;
+        }
       }
+      // fallback: toda la página
+      const fullHtml = await page.content();
+      return fullHtml;
+    } finally {
+      await page.close().catch(()=>{});
     }
-  } finally {
-    await browser.close().catch(() => {});
   }
 
-  log('Proceso finalizado.');
-}
+  // 4) Procesar cola y preparar payload para /report
+  const itemsForReport = [];
+  for (const it of queue) {
+    const receipt = String(it.receipt_number || '').trim();
+    const tramiteId = it.tramite_id ?? it.id; // prioridad a tramite_id; si no, usa id
+    if (!receipt || !tramiteId) {
+      log('• Item inválido (sin receipt o tramite_id):', JSON.stringify(it));
+      continue;
+    }
 
-run().catch((e) => {
-  console.error('Error fatal:', e);
+    log('• Pendiente:', receipt);
+
+    try {
+      // Pequeño delay entre consultas para evitar rate-limits
+      await sleep(1000 + Math.floor(Math.random() * 500));
+
+      const html = await fetchCaseHtml(receipt);
+
+      // Validación básica
+      if (!html || html.length < 200) {
+        throw new Error('HTML de resultado demasiado corto.');
+      }
+
+      itemsForReport.push({ tramite_id: tramiteId, html });
+    } catch (err) {
+      // No abortamos el lote completo; continuamos con los demás
+      console.error(`✗ Error con ${receipt}:`, err.message);
+      // (Opcional: podríamos reportar fails individualmente a otra ruta)
+    }
+  }
+
+  // Si no hay nada que reportar, cerramos
+  if (!itemsForReport.length) {
+    await browser.close();
+    log('No hay items válidos para reportar.');
+    process.exit(0);
+  }
+
+  // 5) POST /report
+  const reportUrl = `${API_BASE}/report`;
+  try {
+    const res = await fetch(reportUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: itemsForReport }),
+    });
+    const bodyText = await res.text().catch(()=> '');
+    let bodyJson = null;
+    try { bodyJson = JSON.parse(bodyText); } catch {}
+    if (!res.ok) {
+      throw new Error(`Report HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
+    }
+    log('Reporte enviado. Respuesta:', bodyJson ? JSON.stringify(bodyJson).slice(0, 500) : bodyText.slice(0, 500));
+  } catch (err) {
+    console.error('ERROR al enviar reporte:', err.message);
+    await browser.close();
+    process.exit(1);
+  }
+
+  await browser.close();
+  log('Listo.');
+  process.exit(0);
+})().catch((e) => {
+  console.error('FATAL:', e);
   process.exit(1);
 });
