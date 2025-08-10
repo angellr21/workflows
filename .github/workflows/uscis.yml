@@ -1,42 +1,51 @@
-name: USCIS Check
+name: USCIS checker
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # cada 15 minutos (ajusta si lo deseas)
-  workflow_dispatch: {}
+    # Corre cada 15 minutos
+    - cron: "*/15 * * * *"
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    runs-on: ubuntu-latest
 
     env:
       API_BASE: ${{ secrets.API_BASE }}
       API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
-      - name: Run actions/checkout@v4
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run actions/setup-node@v4
+      - name: Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Echo base y probar /queue rápidamente
+      - name: Sanity check de API_BASE
+        shell: bash
         run: |
           echo "RAW_API_BASE=$API_BASE"
           node -e "let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); console.log('NORMALIZED_API_BASE='+b); console.log('TEST_URL='+b+'/queue')"
           node -e "const https=require('node:https'); let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); let u=b+'/queue'; const opt=new URL(u); opt.headers={'Accept':'application/json','Authorization':'Bearer '+process.env.API_TOKEN}; https.get(opt,(res)=>{console.log('TEST_STATUS',res.statusCode); let d=''; res.on('data',c=>d+=c); res.on('end',()=>console.log((d||'').slice(0,500)));}).on('error',e=>console.error('TEST_ERR',e.message)); setTimeout(()=>{},1500);"
 
-      - name: Instalar Playwright (Chromium) y deps
+      - name: Inicializar proyecto y Playwright
+        shell: bash
         run: |
           npm init -y
+          npm install playwright@1.45.0
           npx playwright install --with-deps chromium
 
+      # *** Paso de debug: mostrar exactamente el script que se ejecutará ***
+      - name: Mostrar script que se va a ejecutar (debug)
+        shell: bash
+        run: |
+          echo "=== scripts/uscis_check.cjs (head) ==="
+          sed -n '1,200p' scripts/uscis_check.cjs
+          echo "=== EOF (head) ==="
+
       - name: Ejecutar USCIS check (headless)
-        env:
-          API_BASE: ${{ secrets.API_BASE }}
-          API_TOKEN: ${{ secrets.API_TOKEN }}
+        shell: bash
         run: |
           node ./scripts/uscis_check.cjs
