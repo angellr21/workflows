@@ -1,12 +1,16 @@
+/* scripts/package.json */
+/* Dependencias centralizadas para el scraper. */
 {
-  "name": "workflows",
+  "name": "uscis-scraper-worker",
   "version": "1.0.0",
+  "description": "Scraper worker for USCIS using Playwright",
   "private": true,
   "license": "UNLICENSED",
   "type": "commonjs",
   "scripts": {
-    "uscis:check": "node ./scripts/uscis_check.cjs"
+    "uscis:check": "node ./uscis_check.cjs"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "playwright-chromium": "^1.45.0"
+  }
 }
