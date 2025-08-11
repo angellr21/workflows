@@ -9,7 +9,6 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const normalizeBase = (u) => String(u || '').trim().replace(/\/+$/, '').replace(/\/api\/uscis\/?$/, '');
 const textSnippet = (htmlOrText, max = 600) => {
   if (!htmlOrText) return '';
-  // Si parece HTML, quitamos etiquetas de forma simple
   const txt = htmlOrText.includes('<')
     ? htmlOrText.replace(/<script[\s\S]*?<\/script>/gi, ' ')
                 .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -215,7 +214,6 @@ async function tryFormFlow(page, receipt) {
     return { ok: false, error: errText.trim(), html };
   }
 
-  // También intentamos body plain text por si es un mensaje fuera de #formErrors
   const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
   if (bodyText) {
     return { ok: false, error: textSnippet(bodyText, 240), html };
@@ -332,4 +330,25 @@ async function scrapeCase(page, receiptNumberRaw) {
         error: result.error || 'Unknown error'
       });
     }
-    await sleep(1200 + Math.random()
+    // 🔧 Corrección: cerrar correctamente la llamada
+    await sleep(1200 + Math.random() * 1200);
+  }
+
+  // 2) Reportes (POST) — solo si hay algo que enviar
+  if (successItems.length) {
+    log(`Reporting success items: ${successItems.length}`);
+    await reportSuccessToApi(successItems);
+  } else {
+    log('No successful scrapes to report.');
+  }
+
+  if (failedItems.length) {
+    log(`Reporting failed items: ${failedItems.length}`);
+    await reportFailedToApi(failedItems);
+  } else {
+    log('No failed scrapes to report.');
+  }
+
+  await browser.close();
+  log('--- Scraping Cycle Finished ---');
+})();
