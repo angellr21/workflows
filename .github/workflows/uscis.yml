@@ -1,5 +1,5 @@
 # .github/workflows/uscis.yml
-# Versión final con las rutas y comandos corregidos según la estructura real del repositorio.
+# Versión final con ejecución directa del script para máxima fiabilidad.
 name: USCIS Check
 
 on:
@@ -37,9 +37,10 @@ jobs:
           echo "Secrets validation passed."
 
       - name: Install dependencies
-        # CORRECCIÓN: Se ejecuta desde la raíz, donde está el package.json.
+        # Se ejecuta desde la raíz, donde está el package.json.
         run: npm install
 
       - name: Run USCIS check script
-        # CORRECCIÓN: Se ejecuta desde la raíz. El script en package.json ya tiene la ruta correcta.
-        run: npm run uscis:check
+        # CORRECCIÓN FINAL: Ejecutamos node directamente con la ruta al script
+        # para evitar problemas de resolución de rutas con 'npm run'.
+        run: node scripts/uscis_check.cjs
