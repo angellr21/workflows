@@ -1,14 +1,12 @@
 {
-  "name": "uscis-scraper-worker",
-  "version": "1.0.0",
-  "description": "Scraper worker for USCIS using Playwright",
+  "name": "uscis-workflows",
   "private": true,
-  "license": "UNLICENSED",
-  "type": "commonjs",
+  "version": "1.0.0",
+  "description": "USCIS checker runner for GitHub Actions",
   "scripts": {
-    "uscis:check": "node ./uscis_check.cjs"
+    "check": "node scripts/uscis_check.cjs"
   },
   "dependencies": {
-    "playwright-chromium": "^1.45.0"
+    "playwright": "^1.45.0"
   }
 }
