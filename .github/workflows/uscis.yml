@@ -1,5 +1,5 @@
 # .github/workflows/uscis.yml
-# Versión con la ruta de caché corregida.
+# Versión simplificada sin caché para máxima compatibilidad.
 name: USCIS Check
 
 on:
@@ -27,10 +27,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # Habilita el cache para las dependencias de npm.
-          cache: 'npm'
-          # CORRECCIÓN: Apuntamos al package.json dentro de la carpeta scripts.
-          cache-dependency-path: 'scripts/package.json'
+          # CORRECCIÓN: Se eliminaron las líneas de 'cache' y 'cache-dependency-path'
+          # para evitar errores de resolución de rutas y simplificar el proceso.
 
       - name: Validate secrets are set
         run: |
