@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* scripts/uscis_check.cjs */
-/* Worker USCIS – flujo y selectores robustos (direct + form) + payloads compatibles. */
+/* Worker USCIS – flujo y selectores robustos (direct + form) + payloads compatibles + soporte force queue. */
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
@@ -13,6 +13,17 @@ const API_BASE_URL = normalizeBase(process.env.API_BASE);
 const API_TOKEN = process.env.API_TOKEN;
 const USCIS_LANDING_URL = 'https://egov.uscis.gov/casestatus/landing.do';
 const USCIS_RESULTS_URL = 'https://egov.uscis.gov/casestatus/mycasestatus.do';
+
+// Decidir si forzamos la cola
+const shouldForceQueue = (() => {
+  const v = (process.env.FORCE_QUEUE || '').toLowerCase();
+  if (v === '1' || v === 'true') return true;
+  const event = (process.env.GITHUB_EVENT_NAME || '').toLowerCase();
+  return event === 'workflow_dispatch'; // si el run es manual, forzar
+})();
+
+let queueLimit = parseInt(process.env.QUEUE_LIMIT || '10', 10);
+if (!Number.isFinite(queueLimit) || queueLimit < 1 || queueLimit > 100) queueLimit = 10;
 
 const REQUIRED_ENVS = ['API_BASE', 'API_TOKEN'];
 for (const v of REQUIRED_ENVS) {
@@ -55,11 +66,23 @@ async function postJson(url, payload) {
   return res.json().catch(() => ({}));
 }
 
-const apiUrl = (endpoint) => `${API_BASE_URL}/api/uscis/${endpoint}`;
+function apiUrl(endpoint, params = null) {
+  let url = `${API_BASE_URL}/api/uscis/${endpoint}`;
+  if (params && Object.keys(params).length) {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && String(v).trim() !== '') {
+        qs.append(k, String(v));
+      }
+    }
+    const q = qs.toString();
+    if (q) url += `?${q}`;
+  }
+  return url;
+}
 
 // Soft-fail para queue: si 500, devolvemos vacío para no romper el job
-const getQueueFromApi = async () => {
-  const url = apiUrl('queue');
+const getQueueFromApi = async (url) => {
   try {
     return await getJson(url);
   } catch (err) {
@@ -73,7 +96,6 @@ const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), { items 
 
 // --- PARSE HELPERS ---
 async function extractStatusFromPage(page) {
-  // Intentar contenedor principal moderno
   const titleSelCandidates = [
     '.current-status-sec h1',
     'div.current-status-sec h1',
@@ -115,16 +137,14 @@ async function extractStatusFromPage(page) {
 
 // --- SCRAPER CORE ---
 async function tryDirectResults(page, receipt) {
-  // Intento directo: ?appReceiptNum= (si redirige al landing, haremos fallback)
   const url = `${USCIS_RESULTS_URL}?appReceiptNum=${encodeURIComponent(receipt)}`;
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // Si no estamos en mycasestatus.do o no aparece el bloque, no forzar error; solo fallback
   const inResults = page.url().includes('mycasestatus.do');
   if (!inResults) return null;
 
   try {
-    await page.waitForTimeout(800); // pequeña pausa para render
+    await page.waitForTimeout(800);
     const html = await page.content();
     const { title, body } = await extractStatusFromPage(page);
     if (title || body) {
@@ -137,7 +157,6 @@ async function tryDirectResults(page, receipt) {
 async function tryFormFlow(page, receipt) {
   await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // Posibles inputs del recibo
   const inputCandidates = ['#receipt_number', 'input[name="appReceiptNum"]'];
   let inputFound = false;
   for (const sel of inputCandidates) {
@@ -150,7 +169,6 @@ async function tryFormFlow(page, receipt) {
   }
   if (!inputFound) throw new Error('Receipt input not found');
 
-  // Submit preferido por name según casos reales
   const submitCandidates = ['input[name="initCaseSearch"]', 'button[type="submit"]', 'input[type="submit"]'];
   let clicked = false;
   for (const sel of submitCandidates) {
@@ -161,12 +179,8 @@ async function tryFormFlow(page, receipt) {
       break;
     }
   }
-  if (!clicked) {
-    // fallback: Enter
-    await page.keyboard.press('Enter').catch(() => {});
-  }
+  if (!clicked) await page.keyboard.press('Enter').catch(() => {});
 
-  // Esperar resultado
   try {
     await Promise.race([
       page.waitForURL(/mycasestatus\.do/i, { timeout: 20000 }),
@@ -181,13 +195,11 @@ async function tryFormFlow(page, receipt) {
     return { ok: true, status: title || null, details: body || null, html };
   }
 
-  // ¿Mensaje de error?
   const errText = await page.locator('#formErrors').first().textContent().catch(() => null);
   if (errText && errText.trim()) {
     return { ok: false, error: errText.trim(), html };
   }
 
-  // No pudimos extraer nada útil
   return { ok: false, error: 'Unable to extract status text', html };
 }
 
@@ -196,7 +208,6 @@ async function scrapeCase(page, receiptNumberRaw) {
   const result = { receipt_number: receiptNumber, ok: false, status: null, details: null, error: null, fullPageHtml: null };
 
   try {
-    // 1) Intento directo
     const direct = await tryDirectResults(page, receiptNumber);
     if (direct && direct.ok) {
       result.ok = true;
@@ -206,7 +217,6 @@ async function scrapeCase(page, receiptNumberRaw) {
       return result;
     }
 
-    // 2) Fallback: flujo del formulario
     const viaForm = await tryFormFlow(page, receiptNumber);
     if (viaForm.ok) {
       result.ok = true;
@@ -240,15 +250,17 @@ async function scrapeCase(page, receiptNumberRaw) {
   });
 
   const ctx = await browser.newContext({
-    // Un UA “humano” reduce bloqueos menores
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36'
   });
   const page = await ctx.newPage();
 
-  // 1) Pedir cola
-  const queueUrl = apiUrl('queue');
+  // 1) Pedir cola (con o sin force, según contexto)
+  const queueUrl = apiUrl('queue', {
+    force: shouldForceQueue ? '1' : undefined,
+    limit: queueLimit
+  });
   log('Fetching queue from API (GET):', queueUrl);
-  const queuePayload = await getQueueFromApi();
+  const queuePayload = await getQueueFromApi(queueUrl);
 
   // Normalizar a objetos { tramite_id, receipt_number }
   const queue = (() => {
@@ -294,10 +306,10 @@ async function scrapeCase(page, receiptNumberRaw) {
         error: result.error || 'Unknown error'
       });
     }
-    await sleep(1200 + Math.random() * 1200); // Jitter entre peticiones
+    await sleep(1200 + Math.random() * 1200);
   }
 
-  // 2) Reportes (POST) — solo si hay algo que enviar con el shape correcto
+  // 2) Reportes (POST) — solo si hay algo que enviar
   if (successItems.length) {
     log(`Reporting success items: ${successItems.length}`);
     await reportSuccessToApi(successItems);
