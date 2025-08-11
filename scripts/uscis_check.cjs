@@ -1,6 +1,6 @@
+#!/usr/bin/env node
 /* scripts/uscis_check.cjs */
 /* Versión del scraper con manejo de errores mejorado y logging. */
-#!/usr/bin/env node
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
@@ -14,173 +14,139 @@ const API_TOKEN = process.env.API_TOKEN;
 const USCIS_LANDING_URL = 'https://egov.uscis.gov/casestatus/landing.do';
 const USCIS_LEGACY_URL = 'https://egov.uscis.gov/casestatus/mycasestatus.do';
 
-if (!API_BASE_URL || !API_TOKEN) {
-    log('FATAL: API_BASE and API_TOKEN environment variables are required.');
+const REQUIRED_ENVS = ['API_BASE', 'API_TOKEN'];
+for (const v of REQUIRED_ENVS) {
+  if (!process.env[v] || !String(process.env[v]).trim()) {
+    console.error(`Missing required env var: ${v}`);
     process.exit(1);
+  }
 }
 
-/**
- * Detecta si la página es un interstitial de Cloudflare.
- * @param {import('playwright-chromium').Page} page
- * @returns {Promise<boolean>}
- */
-async function isCloudflareBlocked(page) {
+// --- SIMPLE FETCH WRAPPER ---
+async function reportToApi(endpoint, payload) {
+  const url = `${API_BASE_URL}/api/uscis/${endpoint}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`API ${endpoint} failed: ${res.status} ${res.statusText} — ${text}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+// --- SCRAPER CORE ---
+async function scrapeCase(page, receipt) {
+  const result = { receipt, ok: false, status: null, details: null, error: null, fullPageHtml: null };
+
+  try {
+    // Intento moderno (landing + form moderno)
+    await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(500);
+    const hasModernForm = await page.locator('form[action*="casestatus"]').count().catch(() => 0);
+
+    if (hasModernForm) {
+      await page.fill('input[name="receipt_number"]', receipt, { timeout: 10000 });
+      await Promise.any([
+        page.click('button[type="submit"]'),
+        page.press('input[name="receipt_number"]', 'Enter')
+      ]);
+      await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+    } else {
+      // Fallback a legacy
+      await page.goto(USCIS_LEGACY_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.fill('#receipt_number', receipt, { timeout: 15000 });
+      await Promise.any([
+        page.click('input[type="submit"]'),
+        page.press('#receipt_number', 'Enter')
+      ]);
+      await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+    }
+
+    // Extraer status
+    const statusTitle = await page.locator('h1, h2, .rows.text-center h1, .rows.text-center h2').first().textContent().catch(() => null);
+    const statusBody = await page.locator('#formErrors, .appointment-sec p, .current-status-sec p, .rows.text-center p').first().textContent().catch(() => null);
+
+    if (statusTitle || statusBody) {
+      result.ok = true;
+      result.status = (statusTitle || '').trim();
+      result.details = (statusBody || '').replace(/\s+/g, ' ').trim();
+    } else {
+      throw new Error('Unable to extract status text');
+    }
+  } catch (err) {
+    result.error = String(err && err.message ? err.message : err);
     try {
-        const title = await page.title();
-        if (/just a moment/i.test(title) || /attention required/i.test(title)) {
-            return true;
-        }
-        const cfLocator = page.locator('#cf-wrapper, #cf-error-details');
-        return await cfLocator.first().isVisible({ timeout: 1000 });
-    } catch {
-        return false;
-    }
+      result.fullPageHtml = await page.content();
+    } catch (_) {}
+  }
+
+  return result;
 }
 
-/**
- * Intenta "calentar" la página para pasar el control de Cloudflare.
- * @param {import('playwright-chromium').Page} page
- * @returns {Promise<boolean>} - True si se pasó el bloqueo, false si persiste.
- */
-async function warmUpPage(page) {
-    for (let i = 0; i < 3; i++) {
-        if (!(await isCloudflareBlocked(page))) return true;
-        log(`Cloudflare detected. Waiting and reloading... (Attempt ${i + 1})`);
-        await sleep(4000 + Math.random() * 2000);
-        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-    }
-    return !(await isCloudflareBlocked(page));
-}
-
-/**
- * Lógica principal de scraping para una URL y un número de recibo.
- * @param {import('playwright-chromium').BrowserContext} context
- * @param {string} url
- * @param {string} receiptNumber
- * @returns {Promise<{html: string|null, error: string|null, fullPageHtml: string|null}>}
- */
-async function scrapeReceiptOnUrl(context, url, receiptNumber) {
-    const page = await context.newPage();
-    try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
-        if (!(await warmUpPage(page))) {
-            return { html: null, error: 'cloudflare_block', fullPageHtml: await page.content() };
-        }
-
-        const inputSelector = 'input[name="appReceiptNum"]';
-        const input = page.locator(inputSelector);
-        await input.waitFor({ state: 'visible', timeout: 15000 });
-
-        await input.fill(receiptNumber);
-        await page.locator('input[type="submit"]').click();
-
-        await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-
-        const statusDiv = page.locator('.rows.text-center');
-        await statusDiv.waitFor({ state: 'visible', timeout: 20000 });
-        
-        const resultHtml = await statusDiv.innerHTML();
-        return { html: resultHtml, error: null, fullPageHtml: null };
-
-    } catch (e) {
-        log(`Scraping failed for ${receiptNumber} on ${url}: ${e.message}`);
-        const fullHtml = await page.content().catch(() => 'Could not get page content.');
-        // Identifica el tipo de error para un mejor reporte.
-        const errorType = e.message.includes('Timeout') ? 'element_timeout' : 'generic_error';
-        return { html: null, error: errorType, fullPageHtml: fullHtml };
-    } finally {
-        await page.close();
-    }
-}
-
-/**
- * Reporta los resultados (éxitos o fallos) a la API de Laravel.
- * @param {string} endpoint
- * @param {object[]} items
- */
-async function reportToApi(endpoint, items) {
-    if (items.length === 0) return;
-    const url = `${API_BASE_URL}/api/uscis/${endpoint}`;
-    log(`Reporting ${items.length} items to ${endpoint}...`);
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${API_TOKEN}`,
-                'Accept': 'application/json',
-            },
-            body: JSON.stringify({ items }),
-        });
-        if (!response.ok) {
-            log(`API Error: Failed to report to ${endpoint}. Status: ${response.status}`, await response.text());
-        }
-    } catch (e) {
-        log(`Network Error: Could not report to ${endpoint}: ${e.message}`);
-    }
-}
-
-// --- MAIN EXECUTION ---
 (async () => {
-    log('--- Starting USCIS Scraping Cycle ---');
-    let queue = [];
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/uscis/queue`, {
-            headers: { 'Authorization': `Bearer ${API_TOKEN}` }
-        });
-        if (!response.ok) throw new Error(`API returned status ${response.status}`);
-        const data = await response.json();
-        queue = data.queue || [];
-        log(`Fetched ${queue.length} cases to process.`);
-    } catch (e) {
-        log(`FATAL: Could not fetch queue from API: ${e.message}`);
-        process.exit(1);
-    }
+  log('--- Scraping Cycle Started ---');
+  log('API_BASE_URL:', API_BASE_URL);
 
-    if (queue.length === 0) {
-        log('Queue is empty. Exiting.');
-        return;
-    }
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--disable-setuid-sandbox'
+    ]
+  });
 
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    });
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
 
-    const successfulScrapes = [];
-    const failedScrapes = [];
+  // 1) Pedir cola a la API
+  log('Fetching queue from API...');
+  const queue = await (async () => {
+    const data = await reportToApi('queue', {});
+    if (!data || !Array.isArray(data.receipts)) return [];
+    return data.receipts.map(r => String(r || '').trim()).filter(Boolean);
+  })();
 
-    for (const item of queue) {
-        const { tramite_id, receipt_number } = item;
-        log(`Processing: ${receipt_number}`);
-
-        let result = await scrapeReceiptOnUrl(context, USCIS_LANDING_URL, receipt_number);
-        // Si falla en la URL principal, intenta con la URL legacy como fallback.
-        if (result.error) {
-            log(`Primary URL failed for ${receipt_number}. Trying legacy URL...`);
-            await sleep(2000); // Pausa antes del reintento
-            result = await scrapeReceiptOnUrl(context, USCIS_LEGACY_URL, receipt_number);
-        }
-
-        if (result.html) {
-            log(`SUCCESS for ${receipt_number}`);
-            successfulScrapes.push({ tramite_id, html: result.html });
-        } else {
-            log(`FAILURE for ${receipt_number}. Error: ${result.error}`);
-            failedScrapes.push({
-                receipt_number,
-                error: result.error,
-                // **MEJORA**: Enviamos el HTML de la página fallida para diagnóstico.
-                meta: { failed_html: result.fullPageHtml }
-            });
-        }
-        await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
-    }
-
-    await reportToApi('report', successfulScrapes);
-    await reportToApi('report-failed', failedScrapes);
-
+  log(`Queue size: ${queue.length}`);
+  if (!queue.length) {
     await browser.close();
-    log('--- Scraping Cycle Finished ---');
+    log('No receipts to process. Exiting.');
+    process.exit(0);
+  }
+
+  const successfulScrapes = [];
+  const failedScrapes = [];
+
+  for (const receipt of queue) {
+    log(`Processing: ${receipt}`);
+    const result = await scrapeCase(page, receipt);
+    if (result.ok) {
+      successfulScrapes.push({
+        receipt: result.receipt,
+        status: result.status,
+        details: result.details
+      });
+    } else {
+      failedScrapes.push({
+        receipt: result.receipt,
+        error: result.error,
+        // **MEJORA**: Enviamos el HTML de la página fallida para diagnóstico.
+        meta: { failed_html: result.fullPageHtml }
+      });
+    }
+    await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
+  }
+
+  await reportToApi('report', successfulScrapes);
+  await reportToApi('report-failed', failedScrapes);
+
+  await browser.close();
+  log('--- Scraping Cycle Finished ---');
 })();
