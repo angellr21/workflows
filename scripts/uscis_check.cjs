@@ -1,12 +1,22 @@
 #!/usr/bin/env node
 /* scripts/uscis_check.cjs */
-/* Worker USCIS – flujo y selectores robustos (direct + form) + payloads compatibles + soporte force queue. */
+/* Worker USCIS – flujo y selectores robustos (direct + form) + payloads compatibles + soporte force queue + debug de fallos. */
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
 const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const normalizeBase = (u) => String(u || '').trim().replace(/\/+$/, '').replace(/\/api\/uscis\/?$/, '');
+const textSnippet = (htmlOrText, max = 600) => {
+  if (!htmlOrText) return '';
+  // Si parece HTML, quitamos etiquetas de forma simple
+  const txt = htmlOrText.includes('<')
+    ? htmlOrText.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                .replace(/<[^>]+>/g, ' ')
+    : String(htmlOrText);
+  return txt.replace(/\s+/g, ' ').trim().slice(0, max);
+};
 
 // --- CONFIGURATION ---
 const API_BASE_URL = normalizeBase(process.env.API_BASE);
@@ -19,7 +29,7 @@ const shouldForceQueue = (() => {
   const v = (process.env.FORCE_QUEUE || '').toLowerCase();
   if (v === '1' || v === 'true') return true;
   const event = (process.env.GITHUB_EVENT_NAME || '').toLowerCase();
-  return event === 'workflow_dispatch'; // si el run es manual, forzar
+  return event === 'workflow_dispatch'; // run manual => forzar
 })();
 
 let queueLimit = parseInt(process.env.QUEUE_LIMIT || '10', 10);
@@ -81,7 +91,7 @@ function apiUrl(endpoint, params = null) {
   return url;
 }
 
-// Soft-fail para queue: si 500, devolvemos vacío para no romper el job
+// Soft-fail para queue
 const getQueueFromApi = async (url) => {
   try {
     return await getJson(url);
@@ -97,12 +107,14 @@ const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), { items 
 // --- PARSE HELPERS ---
 async function extractStatusFromPage(page) {
   const titleSelCandidates = [
+    '#caseStatus h1',
     '.current-status-sec h1',
     'div.current-status-sec h1',
     'div.rows.text-center h1',
     'h1'
   ];
   const bodySelCandidates = [
+    '#caseStatus p',
     '.current-status-sec p',
     'div.current-status-sec p',
     'div.rows.text-center p',
@@ -139,6 +151,7 @@ async function extractStatusFromPage(page) {
 async function tryDirectResults(page, receipt) {
   const url = `${USCIS_RESULTS_URL}?appReceiptNum=${encodeURIComponent(receipt)}`;
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch (_) {}
 
   const inResults = page.url().includes('mycasestatus.do');
   if (!inResults) return null;
@@ -156,6 +169,7 @@ async function tryDirectResults(page, receipt) {
 
 async function tryFormFlow(page, receipt) {
   await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch (_) {}
 
   const inputCandidates = ['#receipt_number', 'input[name="appReceiptNum"]'];
   let inputFound = false;
@@ -184,8 +198,9 @@ async function tryFormFlow(page, receipt) {
   try {
     await Promise.race([
       page.waitForURL(/mycasestatus\.do/i, { timeout: 20000 }),
-      page.waitForSelector('.current-status-sec, #formErrors, .rows.text-center', { timeout: 20000 })
+      page.waitForSelector('#caseStatus, .current-status-sec, #formErrors, .rows.text-center', { timeout: 20000 })
     ]);
+    try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch (_) {}
   } catch (_) {}
 
   const html = await page.content().catch(() => null);
@@ -198,6 +213,12 @@ async function tryFormFlow(page, receipt) {
   const errText = await page.locator('#formErrors').first().textContent().catch(() => null);
   if (errText && errText.trim()) {
     return { ok: false, error: errText.trim(), html };
+  }
+
+  // También intentamos body plain text por si es un mensaje fuera de #formErrors
+  const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+  if (bodyText) {
+    return { ok: false, error: textSnippet(bodyText, 240), html };
   }
 
   return { ok: false, error: 'Unable to extract status text', html };
@@ -250,7 +271,8 @@ async function scrapeCase(page, receiptNumberRaw) {
   });
 
   const ctx = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36',
+    locale: 'en-US',
   });
   const page = await ctx.newPage();
 
@@ -300,30 +322,14 @@ async function scrapeCase(page, receiptNumberRaw) {
         tramite_id,
         html: result.fullPageHtml || ''
       });
+      log(`SUCCESS ${receipt_number}: extracted HTML (${(result.fullPageHtml || '').length} bytes)`);
     } else if (!result.ok) {
+      const snippet = textSnippet(result.fullPageHtml || result.error || '', 600);
+      log(`FAIL ${receipt_number}: ${result.error || 'Unknown error'}`);
+      if (snippet) log(`FAIL ${receipt_number} SNIPPET: ${snippet}`);
       failedItems.push({
         receipt_number,
         error: result.error || 'Unknown error'
       });
     }
-    await sleep(1200 + Math.random() * 1200);
-  }
-
-  // 2) Reportes (POST) — solo si hay algo que enviar
-  if (successItems.length) {
-    log(`Reporting success items: ${successItems.length}`);
-    await reportSuccessToApi(successItems);
-  } else {
-    log('No successful scrapes to report.');
-  }
-
-  if (failedItems.length) {
-    log(`Reporting failed items: ${failedItems.length}`);
-    await reportFailedToApi(failedItems);
-  } else {
-    log('No failed scrapes to report.');
-  }
-
-  await browser.close();
-  log('--- Scraping Cycle Finished ---');
-})();
+    await sleep(1200 + Math.random()
