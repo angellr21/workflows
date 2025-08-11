@@ -1,6 +1,9 @@
 // scripts/uscis_check.cjs
 'use strict';
 
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const { chromium } = require('playwright');
 
 // ========= ENV & CONFIG =========
@@ -15,11 +18,8 @@ if (!RAW_BASE || !API_TOKEN) {
   process.exit(1);
 }
 
-// Normaliza base
 const BASE_IS_ABSOLUTE = /^https?:\/\//i.test(RAW_BASE);
 const BASE_URL = new URL(BASE_IS_ABSOLUTE ? RAW_BASE : `https://${RAW_BASE}`);
-
-// ¿La base YA incluye /api/uscis al final?
 const BASE_HAS_USCIS = /\/api\/uscis\/?$/i.test(BASE_URL.pathname);
 
 // Crea URL de endpoint sin perder /api/uscis cuando ya viene en la base
@@ -27,7 +27,6 @@ function makeApiUrl(endpoint, params) {
   const ep = String(endpoint || '').replace(/^\/+/, ''); // sin slash inicial
   let fullPath;
   if (BASE_HAS_USCIS) {
-    // Concatena al path existente
     const basePath = BASE_URL.pathname.replace(/\/+$/, '');
     fullPath = `${basePath}/${ep}`;
   } else {
@@ -51,31 +50,72 @@ function log(...args) {
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+function errInfo(err) {
+  const c = err && (err.cause || err);
+  const bits = [];
+  if (err && err.message) bits.push(err.message);
+  if (c && c.code) bits.push(`code=${c.code}`);
+  if (c && typeof c.statusCode === 'number') bits.push(`status=${c.statusCode}`);
+  if (c && c.syscall) bits.push(`syscall=${c.syscall}`);
+  if (c && c.hostname) bits.push(`host=${c.hostname}`);
+  return bits.join(' ');
+}
+
+async function fetchWithRetry(doFetch, { tries = 3, baseDelay = 800 } = {}) {
+  let lastErr;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await doFetch();
+    } catch (err) {
+      lastErr = err;
+      if (i < tries) {
+        log(`HTTP retry ${i}/${tries - 1} — ${errInfo(err)}`);
+        await sleep(baseDelay * i);
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function getJson(url, headers = {}) {
-  const res = await fetch(url, { headers });
-  const body = await res.text();
-  if (!res.ok) throw new Error(`GET ${new URL(url).pathname + new URL(url).search} failed: ${res.status} ${res.statusText} — ${body}`);
-  try { return JSON.parse(body); } catch { return {}; }
+  return fetchWithRetry(async () => {
+    const res = await fetch(url, { headers });
+    const body = await res.text();
+    if (!res.ok) {
+      const p = new URL(url);
+      throw new Error(`GET ${p.pathname}${p.search} failed: ${res.status} ${res.statusText} — ${body}`);
+    }
+    try { return JSON.parse(body); } catch { return {}; }
+  });
 }
 
 async function postJson(url, body, headers = {}) {
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`POST ${new URL(url).pathname} failed: ${res.status} ${res.statusText} — ${text}`);
-  return text;
+  return fetchWithRetry(async () => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      const p = new URL(url);
+      throw new Error(`POST ${p.pathname} failed: ${res.status} ${res.statusText} — ${text}`);
+    }
+    return text;
+  });
 }
 
 // ========= API CLIENT =========
 async function fetchQueue({ force, limit } = {}) {
   const u = makeApiUrl('queue', { force: force ? 1 : undefined, limit });
-  log('Fetching queue from API (GET):', u.toString()); // GitHub enmascara secrets; mostrar URL ayuda a depurar
+  log('Fetching queue from API (GET):', u.toString());
   try {
     const data = await getJson(u.toString(), { Authorization: `Bearer ${API_TOKEN}` });
     return Array.isArray(data.queue) ? data.queue
          : Array.isArray(data.tramites) ? data.tramites
          : [];
   } catch (err) {
-    log('Queue API error (soft-fail):', String(err));
+    log('Queue API error (soft-fail):', errInfo(err));
     return [];
   }
 }
@@ -83,13 +123,21 @@ async function fetchQueue({ force, limit } = {}) {
 async function reportSuccess(items) {
   if (!items.length) return;
   const u = makeApiUrl('report');
-  await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  try {
+    await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  } catch (err) {
+    log('Report success error:', errInfo(err));
+  }
 }
 
 async function reportFailures(items) {
   if (!items.length) return;
   const u = makeApiUrl('report-failed');
-  await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  try {
+    await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  } catch (err) {
+    log('Report failed error:', errInfo(err));
+  }
 }
 
 // ========= CLOUDFLARE (espera pasiva) =========
@@ -240,14 +288,14 @@ async function main() {
 
   if (successes.length) {
     log(`Reporting successes: ${successes.length}`);
-    try { await reportSuccess(successes); } catch (e) { log('Report success error:', String(e)); }
+    await reportSuccess(successes);
   } else {
     log('No successful scrapes to report.');
   }
 
   if (failures.length) {
     log(`Reporting failed items: ${failures.length}`);
-    try { await reportFailures(failures); } catch (e) { log('Report failed error:', String(e)); }
+    await reportFailures(failures);
   }
 
   log('--- Scraping Cycle Finished ---');
