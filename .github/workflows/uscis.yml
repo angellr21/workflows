@@ -1,5 +1,5 @@
 # .github/workflows/uscis.yml
-# Versión con comandos npm más robustos usando --prefix.
+# Versión final con las rutas y comandos corregidos según la estructura real del repositorio.
 name: USCIS Check
 
 on:
@@ -37,9 +37,9 @@ jobs:
           echo "Secrets validation passed."
 
       - name: Install dependencies
-        # CORRECCIÓN: Usamos --prefix para decirle a npm que trabaje en la carpeta 'scripts'.
-        run: npm install --prefix scripts
+        # CORRECCIÓN: Se ejecuta desde la raíz, donde está el package.json.
+        run: npm install
 
       - name: Run USCIS check script
-        # CORRECCIÓN: Usamos --prefix para ejecutar el script desde la carpeta correcta.
-        run: npm run uscis:check --prefix scripts
+        # CORRECCIÓN: Se ejecuta desde la raíz. El script en package.json ya tiene la ruta correcta.
+        run: npm run uscis:check
