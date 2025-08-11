@@ -22,23 +22,44 @@ for (const v of REQUIRED_ENVS) {
   }
 }
 
-// --- SIMPLE FETCH WRAPPER ---
-async function reportToApi(endpoint, payload) {
-  const url = `${API_BASE_URL}/api/uscis/${endpoint}`;
+// --- HTTP WRAPPERS ---
+async function getJson(url) {
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Accept': 'application/json'
+    }
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`GET ${url} failed: ${res.status} ${res.statusText} — ${text}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function postJson(url, payload) {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${API_TOKEN}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
     },
     body: JSON.stringify(payload)
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`API ${endpoint} failed: ${res.status} ${res.statusText} — ${text}`);
+    throw new Error(`POST ${url} failed: ${res.status} ${res.statusText} — ${text}`);
   }
   return res.json().catch(() => ({}));
 }
+
+// Endpoints helpers
+const apiUrl = (endpoint) => `${API_BASE_URL}/api/uscis/${endpoint}`;
+const getQueueFromApi = () => getJson(apiUrl('queue'));               // GET
+const reportSuccessToApi = (items) => postJson(apiUrl('report'), items);         // POST
+const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), items);  // POST
 
 // --- SCRAPER CORE ---
 async function scrapeCase(page, receipt) {
@@ -106,10 +127,11 @@ async function scrapeCase(page, receipt) {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // 1) Pedir cola a la API
-  log('Fetching queue from API...');
+  // 1) Pedir cola a la API (GET)
+  const queueUrl = apiUrl('queue');
+  log('Fetching queue from API (GET):', queueUrl);
   const queue = await (async () => {
-    const data = await reportToApi('queue', {});
+    const data = await getQueueFromApi();
     if (!data || !Array.isArray(data.receipts)) return [];
     return data.receipts.map(r => String(r || '').trim()).filter(Boolean);
   })();
@@ -137,15 +159,15 @@ async function scrapeCase(page, receipt) {
       failedScrapes.push({
         receipt: result.receipt,
         error: result.error,
-        // **MEJORA**: Enviamos el HTML de la página fallida para diagnóstico.
         meta: { failed_html: result.fullPageHtml }
       });
     }
     await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
   }
 
-  await reportToApi('report', successfulScrapes);
-  await reportToApi('report-failed', failedScrapes);
+  // 2) Reportes (POST)
+  await reportSuccessToApi(successfulScrapes);
+  await reportFailedToApi(failedScrapes);
 
   await browser.close();
   log('--- Scraping Cycle Finished ---');
