@@ -1,5 +1,3 @@
-/* scripts/package.json */
-/* Dependencias centralizadas para el scraper. */
 {
   "name": "uscis-scraper-worker",
   "version": "1.0.0",
