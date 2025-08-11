@@ -13,6 +13,13 @@ const HEADFUL = process.env.HEADFUL === '1';
 const DEBUG = process.env.DEBUG === '1';
 const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
 
+// Por defecto forzamos queue (equivalente a ?force=1)
+const FORCE = (() => {
+  const v = (process.env.FORCE || '').trim().toLowerCase();
+  if (v === '0' || v === 'false') return false;
+  return true; // default
+})();
+
 if (!RAW_BASE || !API_TOKEN) {
   console.error('Missing API_BASE or API_TOKEN envs.');
   process.exit(1);
@@ -24,7 +31,7 @@ const BASE_HAS_USCIS = /\/api\/uscis\/?$/i.test(BASE_URL.pathname);
 
 // Crea URL de endpoint sin perder /api/uscis cuando ya viene en la base
 function makeApiUrl(endpoint, params) {
-  const ep = String(endpoint || '').replace(/^\/+/, ''); // sin slash inicial
+  const ep = String(endpoint || '').replace(/^\/+/, '');
   let fullPath;
   if (BASE_HAS_USCIS) {
     const basePath = BASE_URL.pathname.replace(/\/+$/, '');
@@ -111,6 +118,9 @@ async function fetchQueue({ force, limit } = {}) {
   log('Fetching queue from API (GET):', u.toString());
   try {
     const data = await getJson(u.toString(), { Authorization: `Bearer ${API_TOKEN}` });
+    if (DEBUG) {
+      try { log('Queue raw payload:', JSON.stringify(data).slice(0, 500)); } catch {}
+    }
     return Array.isArray(data.queue) ? data.queue
          : Array.isArray(data.tramites) ? data.tramites
          : [];
@@ -241,7 +251,8 @@ async function scrapeOne(page, receipt) {
     } catch (err) {
       const html = await page.content().catch(() => '');
       const snippet = html.replace(/\s+/g, ' ').slice(0, 200);
-      errors.push(`${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`);
+      const msg = `${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`;
+      errors.push(msg);
       if (attempt < 2) await sleep(1200 + Math.floor(Math.random() * 800));
     }
   }
@@ -254,7 +265,7 @@ async function main() {
   log('--- Scraping Cycle Started ---');
   log('API_BASE_URL:', BASE_URL.toString());
 
-  const queue = await fetchQueue({ limit: LIMIT });
+  const queue = await fetchQueue({ force: FORCE, limit: LIMIT });
   log('Queue size:', queue.length);
 
   if (!queue.length) {
