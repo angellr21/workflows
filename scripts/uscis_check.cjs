@@ -1,89 +1,63 @@
 #!/usr/bin/env node
-'use strict';
+"use strict";
 
 /**
- * USCIS Worker (Playwright + API)
- * - Lee cola desde /api/uscis/queue (con ?force=1&limit=N)
- * - Intenta obtener el estado por:
- *    1) URL directa mycasestatus.do
- *    2) Flujo del formulario (landing.do)
- * - Reporta éxitos a /api/uscis/report  (items: [{ tram ite_id, html }])
- * - Reporta fallos  a /api/uscis/report-failed (items: [{ receipt_number, error }])
- * - Maneja Cloudflare con esperas y pequeños parches “stealth”
+ * USCIS scraper runner
+ * - Lee la cola desde tu API
+ * - Navega a la página de USCIS con Playwright
+ * - Reporta éxitos o fallos a tu API
+ *
+ * Funciona tanto si API_BASE es:
+ *   - https://aroeservices.com
+ *   - https://aroeservices.com/api/uscis
  */
 
-const { chromium } = require('playwright');
+const { chromium } = require("playwright");
 
-// ===== Configuración por ENV =====
-const API_BASE = process.env.API_BASE || '';
-const API_TOKEN = process.env.API_TOKEN || '';
-const FORCE_QUEUE = (process.env.FORCE_QUEUE || '').toLowerCase() === '1' || (process.env.FORCE_QUEUE || '').toLowerCase() === 'true';
-const QUEUE_LIMIT = Number.parseInt(process.env.QUEUE_LIMIT || '10', 10);
-const HEADLESS = !['0', 'false', 'no'].includes((process.env.HEADLESS || '').toLowerCase());
+// ---------- Config ----------
+const RAW_BASE = (process.env.API_BASE || "").replace(/\/+$/, "");
+const API_TOKEN = process.env.API_TOKEN || "";
+const LIMIT = Number(process.env.LIMIT || 10);
+const FORCE = (process.env.FORCE || "").toString().trim();
 
-// ===== Constantes de USCIS =====
-const USCIS_LANDING_URL = 'https://egov.uscis.gov/casestatus/landing.do';
-const USCIS_DIRECT_URL = 'https://egov.uscis.gov/casestatus/mycasestatus.do?appReceiptNum=';
-
-// ===== Utils =====
-const ts = () => new Date().toISOString();
-const log = (...args) => console.log(`[${ts()}]`, ...args);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const CF_HINTS = [
-  /verify you are human/i,
-  /just a moment/i,
-  /cloudflare/i,
-  /enable javascript and cookies/i,
-  /performance & security by cloudflare/i,
-];
-
-function apiUrl(endpoint) {
-  const base = API_BASE.replace(/\/+$/, '');
-  const ep = String(endpoint || '').replace(/^\/+/, '');
-  return `${base}/api/uscis/${ep}`;
+// Normaliza las rutas para evitar "api/uscis/api/uscis"
+function apiUrl(path) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  const hasPrefix = /\/api\/uscis\/?$/.test(RAW_BASE);
+  return hasPrefix ? `${RAW_BASE}${p}` : `${RAW_BASE}/api/uscis${p}`;
 }
 
-function epForLog(endpoint) {
-  const ep = String(endpoint || '').replace(/^\/?/, '/');
-  return `***${ep}`;
-}
-
-// ===== HTTP helpers (Node 20: fetch nativo) =====
-async function getJson(endpoint) {
-  const url = apiUrl(endpoint);
+async function getJson(url) {
   const res = await fetch(url, {
-    method: 'GET',
     headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      Accept: 'application/json',
+      "Authorization": `Bearer ${API_TOKEN}`,
+      "Accept": "application/json",
     },
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`GET ${epForLog(endpoint)} failed: ${res.status} ${res.statusText} — ${text}`);
+    throw new Error(`GET ${url} failed: ${res.status} ${res.statusText} — ${text}`);
   }
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`GET ${epForLog(endpoint)} returned non-JSON response`);
+    throw new Error(`GET ${url} returned non-JSON: ${text.slice(0, 200)}`);
   }
 }
 
-async function postJson(endpoint, body) {
-  const url = apiUrl(endpoint);
+async function postJson(url, body) {
   const res = await fetch(url, {
-    method: 'POST',
+    method: "POST",
     headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
+      "Authorization": `Bearer ${API_TOKEN}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
     },
-    body: JSON.stringify(body || {}),
+    body: JSON.stringify(body),
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`POST ${epForLog(endpoint)} failed: ${res.status} ${res.statusText} — ${text}`);
+    throw new Error(`POST ${url} failed: ${res.status} ${res.statusText} — ${text}`);
   }
   try {
     return JSON.parse(text);
@@ -92,312 +66,187 @@ async function postJson(endpoint, body) {
   }
 }
 
-// ===== Detección / espera de Cloudflare =====
-async function pageInnerText(page) {
-  try {
-    return (await page.evaluate(() => document.body?.innerText || '')) || '';
-  } catch {
-    return '';
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function snippetOf(str, len = 300) {
+  if (!str) return "";
+  const clean = str.replace(/\s+/g, " ").trim();
+  return clean.length > len ? clean.slice(0, len) : clean;
+}
+
+// ---------- Scraping ----------
+async function processOne(page, receipt) {
+  // Página de status de casos de USCIS
+  const START_URL = "https://egov.uscis.gov/casestatus/landing.do";
+
+  await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  // Heurística básica para detectar Cloudflare / interstitials
+  const bodyText = await page.evaluate(() => document.body.innerText || "");
+  if (/Verify you are human|Performance & security by Cloudflare|Just a moment/i.test(bodyText)) {
+    throw new Error("Cloudflare challenge / interstitial");
   }
-}
 
-async function isCloudflarePage(page) {
-  const txt = await pageInnerText(page);
-  return CF_HINTS.some((re) => re.test(txt));
-}
+  // Diferentes selectores por si cambian el markup
+  const inputSelectors = [
+    'input#receipt_number',
+    'input[name="appReceiptNum"]',
+    'input[name="receipt_number"]',
+    'input[type="text"]',
+  ];
 
-async function waitThroughCloudflare(page, maxMs = 90_000) {
-  const started = Date.now();
-  let notified = false;
-
-  // si ya estamos en resultados
-  if (page.url().includes('mycasestatus.do')) return;
-
-  while (Date.now() - started < maxMs) {
-    if (await isCloudflarePage(page)) {
-      if (!notified) {
-        log('Cloudflare challenge detectado. Esperando a que se complete…');
-        notified = true;
-      }
-      try {
-        await Promise.race([
-          page.waitForURL(/mycasestatus\.do/i, { timeout: 5000 }),
-          page.waitForLoadState('networkidle', { timeout: 5000 }),
-        ]);
-      } catch (_) {
-        // ignorar timeouts cortos, seguimos esperando
-      }
-      await sleep(1500 + Math.random() * 1500);
-      continue;
+  let found = false;
+  for (const sel of inputSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.fill(receipt, { timeout: 5000 }).catch(() => {});
+      found = true;
+      break;
     }
-
-    // ¿ya hay UI de resultados?
-    const inResults = page.url().includes('mycasestatus.do');
-    const hasUi = await page
-      .locator('#caseStatus, .current-status-sec, .rows.text-center, .case-status')
-      .first()
-      .count()
-      .catch(() => 0);
-    if (inResults || hasUi) return;
-
-    await sleep(1200 + Math.random() * 1200);
   }
-}
-
-// ===== Extracción de HTML de estado =====
-async function extractStatusHtml(page) {
-  const candidates =
-    '#caseStatus, .current-status-sec, .rows.text-center, .case-status, main .container';
-  const node = page.locator(candidates).first();
-  try {
-    if ((await node.count()) > 0) {
-      const html = await node.evaluate((el) => el.outerHTML);
-      if (html && html.trim().length > 0) return html;
-    }
-  } catch (_) {}
-  // fallback muy laxo si ya estamos en mycasestatus
-  if (page.url().includes('mycasestatus.do')) {
-    try {
-      const h1 = await page.locator('h1').first().textContent().catch(() => '');
-      const p = await page.locator('p').first().textContent().catch(() => '');
-      if ((h1 && h1.trim()) || (p && p.trim())) {
-        const safe = (s) => (s || '').toString().trim();
-        return `<div id="uscisStatusExtract"><h1>${safe(h1)}</h1><p>${safe(p)}</p></div>`;
-      }
-    } catch (_) {}
-  }
-  return null;
-}
-
-async function textSnippet(page, max = 300) {
-  const t = await pageInnerText(page);
-  return t.replace(/\s+/g, ' ').trim().slice(0, max);
-}
-
-// ===== Flujos de scraping =====
-async function tryDirectResults(page, receipt) {
-  const url = `${USCIS_DIRECT_URL}${encodeURIComponent(receipt)}`;
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-  try {
-    await page.waitForLoadState('networkidle', { timeout: 8000 });
-  } catch (_) {}
-  await waitThroughCloudflare(page, 90_000);
-
-  return extractStatusHtml(page);
-}
-
-async function tryFormFlow(page, receipt) {
-  await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-  try {
-    await page.waitForLoadState('networkidle', { timeout: 8000 });
-  } catch (_) {}
-  await waitThroughCloudflare(page, 90_000);
-
-  const input = page.locator('input[name="appReceiptNum"], input#receipt_number').first();
-  if ((await input.count().catch(() => 0)) === 0) {
-    const snip = await textSnippet(page);
-    const err = new Error('Receipt input not found');
-    err.snippet = snip;
-    throw err;
+  if (!found) {
+    // Dump rápido de la página para debug
+    const html = await page.content();
+    const text = await page.evaluate(() => document.body.innerText || "");
+    throw new Error(`Receipt input not found — ${snippetOf(text || html, 300)}`);
   }
 
-  await input.click({ timeout: 10_000 });
-  await input.fill(receipt, { timeout: 10_000 });
-
-  // Posibles botones de submit
-  const submitCandidates = [
-    'button:has-text("Check")',
+  // Click en el botón "Check Status" (varias opciones)
+  const clickSelectors = [
     'button:has-text("Check Status")',
-    '#caseStatusSearch',
-    '#casestatus-search',
+    'input[type="submit"][value*="Check"]',
     'button[type="submit"]',
     'input[type="submit"]',
   ];
 
   let clicked = false;
-  for (const sel of submitCandidates) {
-    const btn = page.locator(sel).first();
-    try {
-      if ((await btn.count()) > 0) {
-        await Promise.allSettled([btn.click({ timeout: 5000 })]);
-        clicked = true;
-        break;
-      }
-    } catch (_) {}
+  for (const sel of clickSelectors) {
+    const btn = await page.$(sel);
+    if (btn) {
+      await btn.click({ timeout: 8000 }).catch(() => {});
+      clicked = true;
+      break;
+    }
   }
-
   if (!clicked) {
-    // fallback con Enter
-    try {
-      await input.press('Enter', { delay: 20 });
-    } catch (_) {}
+    throw new Error("Submit button not found");
   }
 
-  try {
-    await Promise.race([
-      page.waitForURL(/mycasestatus\.do/i, { timeout: 20_000 }),
-      page.waitForSelector('#caseStatus, .current-status-sec, #formErrors, .rows.text-center', {
-        timeout: 20_000,
-      }),
-    ]);
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 8000 });
-    } catch (_) {}
-  } catch (_) {}
+  // Espera algo de contenido de resultado
+  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+  await sleep(800);
 
-  await waitThroughCloudflare(page, 90_000);
+  // Extrae HTML completo para que el backend lo procese
+  const html = await page.content();
+  const text2 = await page.evaluate(() => document.body.innerText || "");
+  if (/Verify you are human|Performance & security by Cloudflare|Just a moment/i.test(text2)) {
+    throw new Error("Cloudflare challenge after submit");
+  }
 
-  const html = await extractStatusHtml(page);
-  if (html) return html;
+  // Opcional: validación mínima de que no es la pantalla inicial
+  if (/Enter a receipt number|Status Information/i.test(text2) === false && html.length < 1000) {
+    throw new Error("Unexpected result page");
+  }
 
-  const snip = await textSnippet(page);
-  const err = new Error('No status content found');
-  err.snippet = snip;
-  throw err;
+  return html;
 }
 
-// ===== Ejecución principal =====
+// ---------- Main ----------
 (async () => {
-  if (!API_BASE || !API_TOKEN) {
-    console.error('Faltan variables de entorno: API_BASE y/o API_TOKEN');
+  console.log(`[${new Date().toISOString()}] --- Scraping Cycle Started ---`);
+  console.log(`[${new Date().toISOString()}] API_BASE_URL: ${RAW_BASE || "(not set)"}`);
+
+  if (!RAW_BASE || !API_TOKEN) {
+    console.error("Missing API_BASE or API_TOKEN env vars");
     process.exit(1);
   }
 
-  log('--- Scraping Cycle Started ---');
-  log(`API_BASE_URL: ${API_BASE}`);
+  const limitParam = isFinite(LIMIT) && LIMIT > 0 ? `limit=${LIMIT}` : "limit=10";
+  const forceParam = FORCE ? `&force=${encodeURIComponent(FORCE)}` : "";
+  const queueUrl = apiUrl(`/queue?${limitParam}${forceParam}`);
 
-  const params = [];
-  if (FORCE_QUEUE) params.push('force=1');
-  if (QUEUE_LIMIT && Number.isFinite(QUEUE_LIMIT)) params.push(`limit=${QUEUE_LIMIT}`);
-  const queueEndpoint = `queue${params.length ? `?${params.join('&')}` : ''}`;
-
-  let items = [];
+  let list = [];
   try {
-    log(`Fetching queue from API (GET): ${epForLog(queueEndpoint)}`);
-    const data = await getJson(queueEndpoint);
-    items = Array.isArray(data.queue) ? data.queue : [];
-  } catch (e) {
-    log(`Queue API error (soft-fail): ${e.message}`);
-    items = [];
-  }
-
-  log(`Queue size: ${items.length}`);
-  if (items.length === 0) {
-    log('No receipts to process (or API unavailable). Exiting gracefully.');
+    console.log(`[${new Date().toISOString()}] Fetching queue from API (GET): ***${queueUrl.endsWith("/queue") ? "/queue" : "/queue?"}`);
+    const data = await getJson(queueUrl);
+    // Soporta { queue: [...] } o { tramites: [...] }
+    list = data.queue || data.tramites || [];
+  } catch (err) {
+    console.warn(`[${new Date().toISOString()}] Queue API error (soft-fail): ${err.message}`);
+    console.log(`[${new Date().toISOString()}] Queue size: 0`);
+    console.log(`[${new Date().toISOString()}] No receipts to process (or API unavailable). Exiting gracefully.`);
     return;
   }
 
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
+  console.log(`[${new Date().toISOString()}] Queue size: ${list.length}`);
 
-  const ctx = await browser.newContext({
+  if (!Array.isArray(list) || list.length === 0) {
+    console.log(`[${new Date().toISOString()}] No receipts to process (or API unavailable). Exiting gracefully.`);
+    return;
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
     userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-    viewport: { width: 1366, height: 768 },
-    javaScriptEnabled: true,
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
-
-  // Pequeños parches anti-automation
-  await ctx.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    // @ts-ignore
-    window.chrome = { runtime: {} };
-    const origQuery = window.navigator.permissions?.query;
-    if (origQuery) {
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : origQuery(parameters);
-    }
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-  });
+  const page = await context.newPage();
 
   const successes = [];
   const failures = [];
 
-  for (const item of items) {
-    const receipt =
-      (item && (item.receipt_number || item.uscis_receipt_number || '')).toString().trim();
-    const tramiteId = item && item.tramite_id;
+  try {
+    for (const item of list) {
+      const receipt = item.receipt_number || item.uscis_receipt_number;
+      if (!receipt) continue;
 
-    if (!receipt) continue;
+      console.log(`[${new Date().toISOString()}] Processing: ${receipt}`);
 
-    log(`Processing: ${receipt}`);
-    const page = await ctx.newPage();
-    try {
-      // 1) Intento directo
-      let html = await tryDirectResults(page, receipt);
-
-      // 2) Si no hubo suerte, intentar flujo formulario (en una pestaña limpia)
-      if (!html) {
-        await page.close({ runBeforeUnload: false }).catch(() => {});
-        const page2 = await ctx.newPage();
-        html = await tryFormFlow(page2, receipt);
-        await page2.close({ runBeforeUnload: false }).catch(() => {});
-      } else {
-        await page.close({ runBeforeUnload: false }).catch(() => {});
+      try {
+        const html = await processOne(page, receipt);
+        successes.push({ tramite_id: item.tramite_id, html });
+      } catch (err) {
+        const content = await page.content().catch(() => "");
+        const txt = await page.evaluate(() => document.body.innerText || "").catch(() => "");
+        const snap = snippetOf(txt || content, 300);
+        console.log(`[${new Date().toISOString()}] FAIL ${receipt}: ${err.message}`);
+        if (snap) console.log(`[${new Date().toISOString()}] FAIL ${receipt} SNIPPET: ${snap}`);
+        failures.push({ receipt_number: receipt, error: err.message });
       }
 
-      if (html && tramiteId) {
-        successes.push({ tramite_id: tramiteId, html });
-      } else if (html && !tramiteId) {
-        // Debería venir siempre, pero si no: reporta como fallo suave
-        failures.push({ receipt_number: receipt, error: 'Missing tramite_id in queue item' });
-      } else {
-        failures.push({ receipt_number: receipt, error: 'No status content found' });
-      }
-    } catch (e) {
-      const msg = e && e.message ? e.message : 'Unknown error';
-      const snip = e && e.snippet ? e.snippet : await textSnippet(page);
-      log(`FAIL ${receipt}: ${msg}`);
-      if (snip) log(`FAIL ${receipt} SNIPPET: ${snip}`);
-      failures.push({ receipt_number: receipt, error: msg });
-    } finally {
-      await page.close({ runBeforeUnload: false }).catch(() => {});
-      await sleep(400 + Math.random() * 400);
+      // Pequeña pausa anti-bloqueos
+      await sleep(1200 + Math.random() * 1200);
     }
+  } finally {
+    await browser.close().catch(() => {});
   }
 
   // Reporte de éxitos
   if (successes.length > 0) {
     try {
-      log(`Reporting successful items: ${successes.length}`);
-      await postJson('report', {
-        items: successes.map((i) => ({ tramite_id: i.tramite_id, html: i.html })),
-      });
-    } catch (e) {
-      // Si falla el reporte de éxitos, es crítico
-      await browser.close().catch(() => {});
-      throw e;
+      await postJson(apiUrl("/report"), { items: successes });
+      console.log(`[${new Date().toISOString()}] Reported successes: ${successes.length}`);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Error reporting successes: ${err.message}`);
     }
   } else {
-    log('No successful scrapes to report.');
+    console.log(`[${new Date().toISOString()}] No successful scrapes to report.`);
   }
 
-  // Reporte de fallos (no crítico)
+  // Reporte de fallos (estructura que tu API espera)
   if (failures.length > 0) {
     try {
-      log(`Reporting failed items: ${failures.length}`);
-      await postJson('report-failed', {
-        items: failures.map((f) => ({
-          receipt_number: f.receipt_number,
-          error: f.error || 'Unknown error',
-        })),
-      });
-    } catch (e) {
-      // lo registramos pero no reventamos el job si ya reportamos éxitos
-      log(`Warn: reporting failures failed — ${e.message}`);
+      console.log(`[${new Date().toISOString()}] Reporting failed items: ${failures.length}`);
+      await postJson(apiUrl("/report-failed"), { items: failures });
+    } catch (err) {
+      console.error(err.stack || err.message);
     }
   }
 
-  await browser.close().catch(() => {});
-  log('--- Scraping Cycle Finished ---');
+  console.log(`[${new Date().toISOString()}] --- Scraping Cycle Finished ---`);
 })().catch((err) => {
-  console.error(err && err.stack ? err.stack : err);
+  console.error(err.stack || err.message);
   process.exit(1);
 });
