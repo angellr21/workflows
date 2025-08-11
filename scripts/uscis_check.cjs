@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* scripts/uscis_check.cjs */
-/* Worker USCIS – payloads compatibles con la API (report/report-failed). */
+/* Worker USCIS – flujo y selectores robustos (direct + form) + payloads compatibles. */
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
@@ -12,7 +12,7 @@ const normalizeBase = (u) => String(u || '').trim().replace(/\/+$/, '').replace(
 const API_BASE_URL = normalizeBase(process.env.API_BASE);
 const API_TOKEN = process.env.API_TOKEN;
 const USCIS_LANDING_URL = 'https://egov.uscis.gov/casestatus/landing.do';
-const USCIS_LEGACY_URL = 'https://egov.uscis.gov/casestatus/mycasestatus.do';
+const USCIS_RESULTS_URL = 'https://egov.uscis.gov/casestatus/mycasestatus.do';
 
 const REQUIRED_ENVS = ['API_BASE', 'API_TOKEN'];
 for (const v of REQUIRED_ENVS) {
@@ -71,51 +71,155 @@ const getQueueFromApi = async () => {
 const reportSuccessToApi = (items) => postJson(apiUrl('report'), { items });          // { items: [{ tramite_id, html }] }
 const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), { items });   // { items: [{ receipt_number, error }] }
 
+// --- PARSE HELPERS ---
+async function extractStatusFromPage(page) {
+  // Intentar contenedor principal moderno
+  const titleSelCandidates = [
+    '.current-status-sec h1',
+    'div.current-status-sec h1',
+    'div.rows.text-center h1',
+    'h1'
+  ];
+  const bodySelCandidates = [
+    '.current-status-sec p',
+    'div.current-status-sec p',
+    'div.rows.text-center p',
+    '#formErrors',
+    '.appointment-sec p'
+  ];
+
+  let title = null;
+  for (const sel of titleSelCandidates) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.count()) {
+        const txt = (await el.textContent())?.trim();
+        if (txt) { title = txt; break; }
+      }
+    } catch (_) {}
+  }
+
+  let body = null;
+  for (const sel of bodySelCandidates) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.count()) {
+        const txt = (await el.textContent())?.replace(/\s+/g, ' ').trim();
+        if (txt) { body = txt; break; }
+      }
+    } catch (_) {}
+  }
+
+  return { title, body };
+}
+
 // --- SCRAPER CORE ---
-async function scrapeCase(page, receiptNumber) {
+async function tryDirectResults(page, receipt) {
+  // Intento directo: ?appReceiptNum= (si redirige al landing, haremos fallback)
+  const url = `${USCIS_RESULTS_URL}?appReceiptNum=${encodeURIComponent(receipt)}`;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // Si no estamos en mycasestatus.do o no aparece el bloque, no forzar error; solo fallback
+  const inResults = page.url().includes('mycasestatus.do');
+  if (!inResults) return null;
+
+  try {
+    await page.waitForTimeout(800); // pequeña pausa para render
+    const html = await page.content();
+    const { title, body } = await extractStatusFromPage(page);
+    if (title || body) {
+      return { ok: true, status: title || null, details: body || null, html };
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function tryFormFlow(page, receipt) {
+  await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // Posibles inputs del recibo
+  const inputCandidates = ['#receipt_number', 'input[name="appReceiptNum"]'];
+  let inputFound = false;
+  for (const sel of inputCandidates) {
+    const count = await page.locator(sel).count().catch(() => 0);
+    if (count) {
+      await page.fill(sel, receipt, { timeout: 15000 }).catch(() => {});
+      inputFound = true;
+      break;
+    }
+  }
+  if (!inputFound) throw new Error('Receipt input not found');
+
+  // Submit preferido por name según casos reales
+  const submitCandidates = ['input[name="initCaseSearch"]', 'button[type="submit"]', 'input[type="submit"]'];
+  let clicked = false;
+  for (const sel of submitCandidates) {
+    const count = await page.locator(sel).count().catch(() => 0);
+    if (count) {
+      await page.click(sel).catch(() => {});
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) {
+    // fallback: Enter
+    await page.keyboard.press('Enter').catch(() => {});
+  }
+
+  // Esperar resultado
+  try {
+    await Promise.race([
+      page.waitForURL(/mycasestatus\.do/i, { timeout: 20000 }),
+      page.waitForSelector('.current-status-sec, #formErrors, .rows.text-center', { timeout: 20000 })
+    ]);
+  } catch (_) {}
+
+  const html = await page.content().catch(() => null);
+  const { title, body } = await extractStatusFromPage(page);
+
+  if (title || body) {
+    return { ok: true, status: title || null, details: body || null, html };
+  }
+
+  // ¿Mensaje de error?
+  const errText = await page.locator('#formErrors').first().textContent().catch(() => null);
+  if (errText && errText.trim()) {
+    return { ok: false, error: errText.trim(), html };
+  }
+
+  // No pudimos extraer nada útil
+  return { ok: false, error: 'Unable to extract status text', html };
+}
+
+async function scrapeCase(page, receiptNumberRaw) {
+  const receiptNumber = String(receiptNumberRaw || '').replace(/\s+/g, '').toUpperCase();
   const result = { receipt_number: receiptNumber, ok: false, status: null, details: null, error: null, fullPageHtml: null };
 
   try {
-    // Intento moderno
-    await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(500);
-    const hasModernForm = await page.locator('form[action*="casestatus"]').count().catch(() => 0);
-
-    if (hasModernForm) {
-      await page.fill('input[name="receipt_number"]', receiptNumber, { timeout: 10000 });
-      await Promise.any([
-        page.click('button[type="submit"]'),
-        page.press('input[name="receipt_number"]', 'Enter')
-      ]);
-      await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
-    } else {
-      // Fallback legacy
-      await page.goto(USCIS_LEGACY_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.fill('#receipt_number', receiptNumber, { timeout: 15000 });
-      await Promise.any([
-        page.click('input[type="submit"]'),
-        page.press('#receipt_number', 'Enter')
-      ]);
-      await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+    // 1) Intento directo
+    const direct = await tryDirectResults(page, receiptNumber);
+    if (direct && direct.ok) {
+      result.ok = true;
+      result.status = direct.status;
+      result.details = direct.details;
+      result.fullPageHtml = direct.html;
+      return result;
     }
 
-    // Extraer status
-    const statusTitle = await page.locator('h1, h2, .rows.text-center h1, .rows.text-center h2').first().textContent().catch(() => null);
-    const statusBody = await page.locator('#formErrors, .appointment-sec p, .current-status-sec p, .rows.text-center p').first().textContent().catch(() => null);
-
-    // Capturar HTML SIEMPRE (éxito o no) para reportSuccess
-    try { result.fullPageHtml = await page.content(); } catch (_) {}
-
-    if (statusTitle || statusBody) {
+    // 2) Fallback: flujo del formulario
+    const viaForm = await tryFormFlow(page, receiptNumber);
+    if (viaForm.ok) {
       result.ok = true;
-      result.status = (statusTitle || '').trim();
-      result.details = (statusBody || '').replace(/\s+/g, ' ').trim();
+      result.status = viaForm.status;
+      result.details = viaForm.details;
+      result.fullPageHtml = viaForm.html;
     } else {
-      throw new Error('Unable to extract status text');
+      result.error = viaForm.error || 'Unknown error';
+      result.fullPageHtml = viaForm.html || null;
     }
   } catch (err) {
     result.error = String(err && err.message ? err.message : err);
-    // HTML ya intentado arriba; si no se pudo, lo dejamos null
+    try { result.fullPageHtml = await page.content(); } catch (_) {}
   }
 
   return result;
@@ -135,7 +239,10 @@ async function scrapeCase(page, receiptNumber) {
     ]
   });
 
-  const ctx = await browser.newContext();
+  const ctx = await browser.newContext({
+    // Un UA “humano” reduce bloqueos menores
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36'
+  });
   const page = await ctx.newPage();
 
   // 1) Pedir cola
@@ -177,7 +284,6 @@ async function scrapeCase(page, receiptNumber) {
     const result = await scrapeCase(page, receipt_number);
 
     if (result.ok && tramite_id) {
-      // El backend requiere html + tramite_id
       successItems.push({
         tramite_id,
         html: result.fullPageHtml || ''
@@ -188,7 +294,7 @@ async function scrapeCase(page, receiptNumber) {
         error: result.error || 'Unknown error'
       });
     }
-    await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
+    await sleep(1200 + Math.random() * 1200); // Jitter entre peticiones
   }
 
   // 2) Reportes (POST) — solo si hay algo que enviar con el shape correcto
