@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* scripts/uscis_check.cjs */
-/* Versión del scraper con manejo de errores mejorado y logging (soft-fail en queue). */
+/* Worker USCIS – payloads compatibles con la API (report/report-failed). */
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
@@ -55,44 +55,43 @@ async function postJson(url, payload) {
   return res.json().catch(() => ({}));
 }
 
-// Endpoints helpers
 const apiUrl = (endpoint) => `${API_BASE_URL}/api/uscis/${endpoint}`;
 
-// Soft-fail: si la API de cola está caída o con 500, devolvemos [] para no romper el job
+// Soft-fail para queue: si 500, devolvemos vacío para no romper el job
 const getQueueFromApi = async () => {
   const url = apiUrl('queue');
   try {
     return await getJson(url);
   } catch (err) {
     log('Queue API error (soft-fail):', err.message);
-    return { receipts: [] };
+    return { tramites: [] };
   }
 };
 
-const reportSuccessToApi = (items) => postJson(apiUrl('report'), items);         // POST
-const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), items);  // POST
+const reportSuccessToApi = (items) => postJson(apiUrl('report'), { items });          // { items: [{ tramite_id, html }] }
+const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), { items });   // { items: [{ receipt_number, error }] }
 
 // --- SCRAPER CORE ---
-async function scrapeCase(page, receipt) {
-  const result = { receipt, ok: false, status: null, details: null, error: null, fullPageHtml: null };
+async function scrapeCase(page, receiptNumber) {
+  const result = { receipt_number: receiptNumber, ok: false, status: null, details: null, error: null, fullPageHtml: null };
 
   try {
-    // Intento moderno (landing + form moderno)
+    // Intento moderno
     await page.goto(USCIS_LANDING_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(500);
     const hasModernForm = await page.locator('form[action*="casestatus"]').count().catch(() => 0);
 
     if (hasModernForm) {
-      await page.fill('input[name="receipt_number"]', receipt, { timeout: 10000 });
+      await page.fill('input[name="receipt_number"]', receiptNumber, { timeout: 10000 });
       await Promise.any([
         page.click('button[type="submit"]'),
         page.press('input[name="receipt_number"]', 'Enter')
       ]);
       await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
     } else {
-      // Fallback a legacy
+      // Fallback legacy
       await page.goto(USCIS_LEGACY_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.fill('#receipt_number', receipt, { timeout: 15000 });
+      await page.fill('#receipt_number', receiptNumber, { timeout: 15000 });
       await Promise.any([
         page.click('input[type="submit"]'),
         page.press('#receipt_number', 'Enter')
@@ -104,6 +103,9 @@ async function scrapeCase(page, receipt) {
     const statusTitle = await page.locator('h1, h2, .rows.text-center h1, .rows.text-center h2').first().textContent().catch(() => null);
     const statusBody = await page.locator('#formErrors, .appointment-sec p, .current-status-sec p, .rows.text-center p').first().textContent().catch(() => null);
 
+    // Capturar HTML SIEMPRE (éxito o no) para reportSuccess
+    try { result.fullPageHtml = await page.content(); } catch (_) {}
+
     if (statusTitle || statusBody) {
       result.ok = true;
       result.status = (statusTitle || '').trim();
@@ -113,9 +115,7 @@ async function scrapeCase(page, receipt) {
     }
   } catch (err) {
     result.error = String(err && err.message ? err.message : err);
-    try {
-      result.fullPageHtml = await page.content();
-    } catch (_) {}
+    // HTML ya intentado arriba; si no se pudo, lo dejamos null
   }
 
   return result;
@@ -138,19 +138,27 @@ async function scrapeCase(page, receipt) {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // 1) Pedir cola a la API (GET, soft-fail)
+  // 1) Pedir cola
   const queueUrl = apiUrl('queue');
   log('Fetching queue from API (GET):', queueUrl);
-  const queue = await (async () => {
-    const data = await getQueueFromApi();
-    // Soportar posibles formas del payload
-    let items = [];
-    if (Array.isArray(data?.receipts)) {
-      items = data.receipts;
-    } else if (Array.isArray(data?.tramites)) {
-      items = data.tramites.map(t => t?.receipt_number ?? t?.receipt ?? t?.number).filter(Boolean);
+  const queuePayload = await getQueueFromApi();
+
+  // Normalizar a objetos { tramite_id, receipt_number }
+  const queue = (() => {
+    if (Array.isArray(queuePayload?.tramites)) {
+      return queuePayload.tramites
+        .map(t => ({
+          tramite_id: t?.tramite_id ?? t?.id ?? null,
+          receipt_number: String(t?.receipt_number ?? '').trim()
+        }))
+        .filter(it => !!it.receipt_number);
     }
-    return items.map(r => String(r || '').trim()).filter(Boolean);
+    if (Array.isArray(queuePayload?.receipts)) {
+      return queuePayload.receipts
+        .map(r => ({ tramite_id: null, receipt_number: String(r ?? '').trim() }))
+        .filter(it => !!it.receipt_number);
+    }
+    return [];
   })();
 
   log(`Queue size: ${queue.length}`);
@@ -160,36 +168,40 @@ async function scrapeCase(page, receipt) {
     process.exit(0);
   }
 
-  const successfulScrapes = [];
-  const failedScrapes = [];
+  const successItems = []; // -> { tramite_id, html }
+  const failedItems  = []; // -> { receipt_number, error }
 
-  for (const receipt of queue) {
-    log(`Processing: ${receipt}`);
-    const result = await scrapeCase(page, receipt);
-    if (result.ok) {
-      successfulScrapes.push({
-        receipt: result.receipt,
-        status: result.status,
-        details: result.details
+  for (const item of queue) {
+    const { receipt_number, tramite_id } = item;
+    log(`Processing: ${receipt_number}`);
+    const result = await scrapeCase(page, receipt_number);
+
+    if (result.ok && tramite_id) {
+      // El backend requiere html + tramite_id
+      successItems.push({
+        tramite_id,
+        html: result.fullPageHtml || ''
       });
-    } else {
-      failedScrapes.push({
-        receipt: result.receipt,
-        error: result.error,
-        meta: { failed_html: result.fullPageHtml }
+    } else if (!result.ok) {
+      failedItems.push({
+        receipt_number,
+        error: result.error || 'Unknown error'
       });
     }
     await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
   }
 
-  // 2) Reportes (POST) — solo si hay algo que enviar
-  if (successfulScrapes.length) {
-    await reportSuccessToApi(successfulScrapes);
+  // 2) Reportes (POST) — solo si hay algo que enviar con el shape correcto
+  if (successItems.length) {
+    log(`Reporting success items: ${successItems.length}`);
+    await reportSuccessToApi(successItems);
   } else {
     log('No successful scrapes to report.');
   }
-  if (failedScrapes.length) {
-    await reportFailedToApi(failedScrapes);
+
+  if (failedItems.length) {
+    log(`Reporting failed items: ${failedItems.length}`);
+    await reportFailedToApi(failedItems);
   } else {
     log('No failed scrapes to report.');
   }
