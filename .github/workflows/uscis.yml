@@ -1,61 +1,47 @@
+# .github/workflows/uscis.yml
+# Versión optimizada del workflow
 name: USCIS Check
 
 on:
   schedule:
+    # Se ejecuta cada 15 minutos.
     - cron: "*/15 * * * *"
+  # Permite la ejecución manual desde la pestaña Actions de GitHub.
   workflow_dispatch: {}
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    runs-on: ubuntu-22.04 # Usamos una versión LTS estable
+    timeout-minutes: 10   # 10 minutos es más que suficiente.
 
-    # ⬇️ Aquí mapeamos los secrets a las variables de entorno usadas por el script
     env:
+      # Mapea los secrets de GitHub a variables de entorno que el script puede usar.
       API_BASE: ${{ secrets.API_BASE }}
       API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
-      - name: Checkout repo de workflows
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          repository: angellr21/workflows
-          fetch-depth: 1
 
-      - name: Node 20
+      - name: Setup Node.js v20
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          # Habilita el cache para las dependencias de npm, acelerando ejecuciones futuras.
+          cache: 'npm'
+          cache-dependency-path: 'scripts/package-lock.json'
 
-      - name: Validar que los secrets existan
+      - name: Validate secrets are set
         run: |
           if [ -z "${API_BASE}" ] || [ -z "${API_TOKEN}" ]; then
-            echo "::error::Faltan los secrets API_BASE y/o API_TOKEN en este repo (Settings → Secrets and variables → Actions)."
+            echo "::error::Secrets API_BASE and/or API_TOKEN are not set in the repository settings."
             exit 1
           fi
-          echo "Secrets presentes: OK"
+          echo "Secrets validation passed."
 
-      - name: Normalizar y probar /queue (sin exponer secretos)
-        run: |
-          echo "RAW_API_BASE=${API_BASE//./****}"  # impresión redactada
-          node -e "let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); console.log('NORMALIZED_API_BASE='+b.replace(/\./g,'****')); console.log('TEST_URL='+b+'/queue')"
-          node -e "const https=require('node:https'); let b=String(process.env.API_BASE||'').trim().replace(/[?#].*$/,'').replace(/\/+$/,'').replace(/\/queue$/i,''); let u=b+'/queue'; const opt=new URL(u); opt.headers={'Accept':'application/json','Authorization':'Bearer '+process.env.API_TOKEN}; https.get(opt,(res)=>{console.log('TEST_STATUS',res.statusCode); let d=''; res.on('data',c=>d+=c); res.on('end',()=>console.log((d||'').slice(0,500)));}).on('error',e=>console.error('TEST_ERR',e.message)); setTimeout(()=>{},1500);"
+      - name: Install dependencies
+        # Navega a la carpeta del script e instala las dependencias definidas en su package.json
+        run: cd scripts && npm install
 
-      - name: Inicializar package.json y scripts
-        run: |
-          npm init -y
-          jq '.private=true | .license="UNLICENSED" | .type="commonjs" | .scripts["uscis:check"]="node ./scripts/uscis_check.cjs"' package.json > package.json.tmp && mv package.json.tmp package.json
-
-      - name: Instalar Playwright (Chromium)
-        run: |
-          npm install --no-audit --no-fund playwright@1.45.0
-          npx playwright install --with-deps chromium
-
-      - name: Mostrar head del script (debug opcional)
-        run: |
-          echo "=== scripts/uscis_check.cjs (head) ==="
-          head -n 220 scripts/uscis_check.cjs || true
-          echo "=== EOF (head) ==="
-
-      - name: Ejecutar chequeo
-        run: npm run uscis:check
+      - name: Run USCIS check script
+        run: cd scripts && npm run uscis:check
