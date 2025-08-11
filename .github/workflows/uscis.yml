@@ -1,5 +1,5 @@
 # .github/workflows/uscis.yml
-# Versión optimizada del workflow
+# Versión con la ruta de caché corregida.
 name: USCIS Check
 
 on:
@@ -11,8 +11,8 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-22.04 # Usamos una versión LTS estable
-    timeout-minutes: 10   # 10 minutos es más que suficiente.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
 
     env:
       # Mapea los secrets de GitHub a variables de entorno que el script puede usar.
@@ -27,9 +27,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # Habilita el cache para las dependencias de npm, acelerando ejecuciones futuras.
+          # Habilita el cache para las dependencias de npm.
           cache: 'npm'
-          cache-dependency-path: 'scripts/package-lock.json'
+          # CORRECCIÓN: Apuntamos al package.json dentro de la carpeta scripts.
+          cache-dependency-path: 'scripts/package.json'
 
       - name: Validate secrets are set
         run: |
@@ -40,8 +41,9 @@ jobs:
           echo "Secrets validation passed."
 
       - name: Install dependencies
-        # Navega a la carpeta del script e instala las dependencias definidas en su package.json
+        # Navega a la carpeta del script e instala las dependencias.
         run: cd scripts && npm install
 
       - name: Run USCIS check script
+        # Ejecuta el script desde la carpeta correcta.
         run: cd scripts && npm run uscis:check
