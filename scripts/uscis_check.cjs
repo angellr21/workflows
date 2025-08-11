@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* scripts/uscis_check.cjs */
-/* Versión del scraper con manejo de errores mejorado y logging. */
+/* Versión del scraper con manejo de errores mejorado y logging (soft-fail en queue). */
 const { chromium } = require('playwright-chromium');
 
 // --- HELPERS ---
@@ -57,7 +57,18 @@ async function postJson(url, payload) {
 
 // Endpoints helpers
 const apiUrl = (endpoint) => `${API_BASE_URL}/api/uscis/${endpoint}`;
-const getQueueFromApi = () => getJson(apiUrl('queue'));               // GET
+
+// Soft-fail: si la API de cola está caída o con 500, devolvemos [] para no romper el job
+const getQueueFromApi = async () => {
+  const url = apiUrl('queue');
+  try {
+    return await getJson(url);
+  } catch (err) {
+    log('Queue API error (soft-fail):', err.message);
+    return { receipts: [] };
+  }
+};
+
 const reportSuccessToApi = (items) => postJson(apiUrl('report'), items);         // POST
 const reportFailedToApi  = (items) => postJson(apiUrl('report-failed'), items);  // POST
 
@@ -127,19 +138,25 @@ async function scrapeCase(page, receipt) {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // 1) Pedir cola a la API (GET)
+  // 1) Pedir cola a la API (GET, soft-fail)
   const queueUrl = apiUrl('queue');
   log('Fetching queue from API (GET):', queueUrl);
   const queue = await (async () => {
     const data = await getQueueFromApi();
-    if (!data || !Array.isArray(data.receipts)) return [];
-    return data.receipts.map(r => String(r || '').trim()).filter(Boolean);
+    // Soportar posibles formas del payload
+    let items = [];
+    if (Array.isArray(data?.receipts)) {
+      items = data.receipts;
+    } else if (Array.isArray(data?.tramites)) {
+      items = data.tramites.map(t => t?.receipt_number ?? t?.receipt ?? t?.number).filter(Boolean);
+    }
+    return items.map(r => String(r || '').trim()).filter(Boolean);
   })();
 
   log(`Queue size: ${queue.length}`);
   if (!queue.length) {
     await browser.close();
-    log('No receipts to process. Exiting.');
+    log('No receipts to process (or API unavailable). Exiting gracefully.');
     process.exit(0);
   }
 
@@ -165,9 +182,17 @@ async function scrapeCase(page, receipt) {
     await sleep(1500 + Math.random() * 1500); // Jitter entre peticiones
   }
 
-  // 2) Reportes (POST)
-  await reportSuccessToApi(successfulScrapes);
-  await reportFailedToApi(failedScrapes);
+  // 2) Reportes (POST) — solo si hay algo que enviar
+  if (successfulScrapes.length) {
+    await reportSuccessToApi(successfulScrapes);
+  } else {
+    log('No successful scrapes to report.');
+  }
+  if (failedScrapes.length) {
+    await reportFailedToApi(failedScrapes);
+  } else {
+    log('No failed scrapes to report.');
+  }
 
   await browser.close();
   log('--- Scraping Cycle Finished ---');
