@@ -1,46 +1,43 @@
-# .github/workflows/uscis.yml
-# Versión final con ejecución directa del script para máxima fiabilidad.
 name: USCIS Check
 
 on:
+  workflow_dispatch:
   schedule:
-    # Se ejecuta cada 15 minutos.
     - cron: "*/15 * * * *"
-  # Permite la ejecución manual desde la pestaña Actions de GitHub.
-  workflow_dispatch: {}
 
 jobs:
   check:
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
-
-    env:
-      # Mapea los secrets de GitHub a variables de entorno que el script puede usar.
-      API_BASE: ${{ secrets.API_BASE }}
-      API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js v20
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
+          cache: "npm"
 
-      - name: Validate secrets are set
+      - name: Validate secrets
         run: |
           if [ -z "${API_BASE}" ] || [ -z "${API_TOKEN}" ]; then
-            echo "::error::Secrets API_BASE and/or API_TOKEN are not set in the repository settings."
+            echo "Missing required secrets: API_BASE or API_TOKEN"
             exit 1
           fi
           echo "Secrets validation passed."
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
 
       - name: Install dependencies
-        # Se ejecuta desde la raíz, donde está el package.json.
         run: npm install
 
-      - name: Run USCIS check script
-        # CORRECCIÓN FINAL: Ejecutamos node directamente con la ruta al script
-        # para evitar problemas de resolución de rutas con 'npm run'.
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run scraper
         run: node scripts/uscis_check.cjs
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
