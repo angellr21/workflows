@@ -1,5 +1,5 @@
 # .github/workflows/uscis.yml
-# Versión simplificada sin caché para máxima compatibilidad.
+# Versión con comandos npm más robustos usando --prefix.
 name: USCIS Check
 
 on:
@@ -27,8 +27,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # CORRECCIÓN: Se eliminaron las líneas de 'cache' y 'cache-dependency-path'
-          # para evitar errores de resolución de rutas y simplificar el proceso.
 
       - name: Validate secrets are set
         run: |
@@ -39,9 +37,9 @@ jobs:
           echo "Secrets validation passed."
 
       - name: Install dependencies
-        # Navega a la carpeta del script e instala las dependencias.
-        run: cd scripts && npm install
+        # CORRECCIÓN: Usamos --prefix para decirle a npm que trabaje en la carpeta 'scripts'.
+        run: npm install --prefix scripts
 
       - name: Run USCIS check script
-        # Ejecuta el script desde la carpeta correcta.
-        run: cd scripts && npm run uscis:check
+        # CORRECCIÓN: Usamos --prefix para ejecutar el script desde la carpeta correcta.
+        run: npm run uscis:check --prefix scripts
