@@ -3,15 +3,34 @@
 
 const { chromium } = require('playwright');
 
-const API_BASE = (process.env.API_BASE || '').replace(/\/+$/, '');
+// ======== CONFIG / UTILS ========
+
+const RAW_BASE = (process.env.API_BASE || '').trim();
 const API_TOKEN = process.env.API_TOKEN || '';
 const HEADFUL = process.env.HEADFUL === '1';
 const DEBUG = process.env.DEBUG === '1';
-const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined; // opcional
+const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
 
-if (!API_BASE || !API_TOKEN) {
+if (!RAW_BASE || !API_TOKEN) {
   console.error('Missing API_BASE or API_TOKEN envs.');
   process.exit(1);
+}
+
+// Normaliza API_BASE y detecta si ya trae /api/uscis al final
+const BASE_URL = new URL(/^https?:\/\//i.test(RAW_BASE) ? RAW_BASE : `https://${RAW_BASE}`);
+const BASE_HAS_USCIS = /\/api\/uscis\/?$/i.test(BASE_URL.pathname);
+
+// Construye URL para endpoints del API sin duplicar rutas
+function makeApiUrl(endpoint, params) {
+  let path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  if (!BASE_HAS_USCIS) path = `/api/uscis${path}`;
+  const url = new URL(path, BASE_URL);
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+    }
+  }
+  return url;
 }
 
 const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing';
@@ -29,7 +48,7 @@ async function getJson(url, headers = {}) {
   const res = await fetch(url, { headers });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`GET ${url} failed: ${res.status} ${res.statusText} — ${text}`);
+    throw new Error(`GET ${new URL(url).pathname + new URL(url).search} failed: ${res.status} ${res.statusText} — ${text}`);
   }
   try { return JSON.parse(text); } catch { return {}; }
 }
@@ -42,22 +61,19 @@ async function postJson(url, body, headers = {}) {
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`POST ${url} failed: ${res.status} ${res.statusText} — ${text}`);
+    throw new Error(`POST ${new URL(url).pathname} failed: ${res.status} ${res.statusText} — ${text}`);
   }
   return text;
 }
 
-async function fetchQueue({ force, limit } = {}) {
-  const u = new URL(`${API_BASE}/api/uscis/queue`);
-  if (force) u.searchParams.set('force', '1');
-  if (limit) u.searchParams.set('limit', String(limit));
+// ======== API CLIENT ========
 
+async function fetchQueue({ force, limit } = {}) {
+  const u = makeApiUrl('/queue', { force: force ? 1 : undefined, limit });
   log('Fetching queue from API (GET):', `${u.pathname}${u.search}`);
   try {
-    const data = await getJson(u.toString(), {
-      Authorization: `Bearer ${API_TOKEN}`,
-    });
-    // El backend a veces devuelve {queue:[]} y a veces {tramites:[]}
+    const data = await getJson(u.toString(), { Authorization: `Bearer ${API_TOKEN}` });
+    // Soporta {queue:[]} o {tramites:[]}
     const items = Array.isArray(data.queue) ? data.queue
                 : Array.isArray(data.tramites) ? data.tramites
                 : [];
@@ -70,30 +86,26 @@ async function fetchQueue({ force, limit } = {}) {
 
 async function reportSuccess(items) {
   if (!items.length) return;
-  const url = `${API_BASE}/api/uscis/report`;
+  const url = makeApiUrl('/report').toString();
   await postJson(url, { items }, { Authorization: `Bearer ${API_TOKEN}` });
 }
 
 async function reportFailures(items) {
   if (!items.length) return;
-  const url = `${API_BASE}/api/uscis/report-failed`;
+  const url = makeApiUrl('/report-failed').toString();
   await postJson(url, { items }, { Authorization: `Bearer ${API_TOKEN}` });
 }
 
-/**
- * Espera a que Cloudflare “Just a moment / Verifying you are human”
- * se complete sola (sin captcha). Máx. ~60s.
- */
+// ======== CLOUDFLARE BYPASS PASIVO ========
+
 async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
-    // ¿Ya está el input del recibo?
     const ready = await page.locator(
       'input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]'
     ).first().isVisible().catch(() => false);
     if (ready) return true;
 
-    // ¿Sigue mostrando la página de Cloudflare?
     const cfTitle = (await page.title().catch(() => '')) || '';
     const cfOn =
       /just a moment|verifying you are human|checking your browser/i.test(cfTitle) ||
@@ -101,11 +113,9 @@ async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
       await page.locator('#cf-please-wait, #challenge-running, iframe[src*="challenge"]').count().then(c => c > 0).catch(() => false);
 
     if (!cfOn) {
-      // Carga normal pero aún no aparece el input — espera un poco más
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await sleep(800);
     } else {
-      // Deja respirar la página para que ejecute el JS de verificación
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await sleep(1500 + Math.floor(Math.random() * 900));
     }
@@ -119,14 +129,16 @@ async function firstVisible(page, selectors = [], { timeoutPerSel = 4000 } = {})
       const el = page.locator(sel).first();
       await el.waitFor({ state: 'visible', timeout: timeoutPerSel });
       return el;
-    } catch (_) { /* try next */ }
+    } catch (_) {}
   }
   return null;
 }
 
+// ======== BROWSER ========
+
 async function launchBrowser() {
   const browser = await chromium.launch({
-    headless: !HEADFUL, // por defecto headless; puedes setear HEADFUL=1 en el workflow para pruebas
+    headless: !HEADFUL,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
@@ -144,7 +156,6 @@ async function launchBrowser() {
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
   });
 
-  // Pequeños ajustes anti-automation
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
@@ -156,21 +167,18 @@ async function launchBrowser() {
   return { browser, context, page };
 }
 
+// ======== SCRAPER ========
+
 async function scrapeOne(page, receipt) {
   const failures = [];
 
-  // 2 intentos por recibo con espera y “jitter”
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' });
 
-      // Esperar Cloudflare si aparece
       const cfOk = await passCloudflare(page, { maxWaitMs: 60000 });
-      if (!cfOk) {
-        throw new Error('Cloudflare guard did not finish in time');
-      }
+      if (!cfOk) throw new Error('Cloudflare guard did not finish in time');
 
-      // Buscar input del recibo
       const input = await firstVisible(page, [
         'input#receipt_number',
         'input[name="appReceiptNum"]',
@@ -187,7 +195,6 @@ async function scrapeOne(page, receipt) {
       await input.fill('');
       await input.type(receipt, { delay: 50 + Math.floor(Math.random() * 25) });
 
-      // Botón de búsqueda
       const submitBtn = await firstVisible(page, [
         'form button[type="submit"]',
         'button#caseStatusSearch',
@@ -195,53 +202,35 @@ async function scrapeOne(page, receipt) {
         'input[type="submit"]',
       ], { timeoutPerSel: 4000 });
 
-      if (!submitBtn) {
-        throw new Error('Submit button not found');
-      }
+      if (!submitBtn) throw new Error('Submit button not found');
 
       await Promise.all([
         page.waitForLoadState('domcontentloaded'),
         submitBtn.click(),
       ]);
 
-      // Si vuelve a aparecer Cloudflare, espera otra vez
       await passCloudflare(page, { maxWaitMs: 45000 });
 
-      // Esperar resultados: un h1 y algún texto descriptivo
-      const titleEl = await firstVisible(page, [
-        '#caseStatus h1',
-        'h1',
-      ], { timeoutPerSel: 8000 });
-
-      const detailsEl = await firstVisible(page, [
-        '#caseStatus .rows p',
-        '#caseStatus p',
-        'article p',
-        'main p',
-        'p',
-      ], { timeoutPerSel: 8000 });
-
-      // Si no hay ninguno visible, igual capturamos el HTML completo para que el backend lo parsee
+      // Devolvemos HTML completo; tu backend lo parsea
       const html = await page.content();
-
-      return { ok: true, html }; // el backend extrae h1 y p
+      return { ok: true, html };
     } catch (err) {
       const html = await page.content().catch(() => '');
       const snippet = html.replace(/\s+/g, ' ').slice(0, 200);
       const msg = `${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`;
       failures.push(msg);
-      if (attempt < 2) {
-        await sleep(1200 + Math.floor(Math.random() * 800));
-      }
+      if (attempt < 2) await sleep(1200 + Math.floor(Math.random() * 800));
     }
   }
 
   return { ok: false, error: failures.join(' | ') };
 }
 
+// ======== MAIN ========
+
 async function main() {
   log('--- Scraping Cycle Started ---');
-  log('API_BASE_URL:', API_BASE);
+  log('API_BASE_URL:', BASE_URL.origin + BASE_URL.pathname.replace(/\/$/, ''));
 
   const queue = await fetchQueue({ limit: LIMIT });
   log('Queue size:', queue.length);
@@ -251,7 +240,7 @@ async function main() {
     return;
   }
 
-  const { browser, page, context } = await launchBrowser();
+  const { browser, context, page } = await launchBrowser();
 
   const successes = [];
   const failures = [];
@@ -262,17 +251,13 @@ async function main() {
       if (!rn) continue;
 
       log('Processing:', rn);
-
       const result = await scrapeOne(page, rn);
 
       if (result.ok) {
         successes.push({ tramite_id: item.tramite_id, html: result.html });
       } else {
         log(`FAIL ${rn}:`, result.error);
-        failures.push({
-          receipt_number: rn,
-          error: result.error.slice(0, 500),
-        });
+        failures.push({ receipt_number: rn, error: result.error.slice(0, 500) });
       }
     }
   } finally {
@@ -295,7 +280,6 @@ async function main() {
   log('--- Scraping Cycle Finished ---');
 }
 
-// Ejecutar
 main().catch(err => {
   console.error(err);
   process.exit(1);
