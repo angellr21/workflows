@@ -3,8 +3,7 @@
 
 const { chromium } = require('playwright');
 
-// ======== CONFIG / UTILS ========
-
+// ========= ENV & CONFIG =========
 const RAW_BASE = (process.env.API_BASE || '').trim();
 const API_TOKEN = process.env.API_TOKEN || '';
 const HEADFUL = process.env.HEADFUL === '1';
@@ -16,15 +15,25 @@ if (!RAW_BASE || !API_TOKEN) {
   process.exit(1);
 }
 
-// Normaliza API_BASE y detecta si ya trae /api/uscis al final
-const BASE_URL = new URL(/^https?:\/\//i.test(RAW_BASE) ? RAW_BASE : `https://${RAW_BASE}`);
+// Normaliza base
+const BASE_IS_ABSOLUTE = /^https?:\/\//i.test(RAW_BASE);
+const BASE_URL = new URL(BASE_IS_ABSOLUTE ? RAW_BASE : `https://${RAW_BASE}`);
+
+// ¿La base YA incluye /api/uscis al final?
 const BASE_HAS_USCIS = /\/api\/uscis\/?$/i.test(BASE_URL.pathname);
 
-// Construye URL para endpoints del API sin duplicar rutas
+// Crea URL de endpoint sin perder /api/uscis cuando ya viene en la base
 function makeApiUrl(endpoint, params) {
-  let path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-  if (!BASE_HAS_USCIS) path = `/api/uscis${path}`;
-  const url = new URL(path, BASE_URL);
+  const ep = String(endpoint || '').replace(/^\/+/, ''); // sin slash inicial
+  let fullPath;
+  if (BASE_HAS_USCIS) {
+    // Concatena al path existente
+    const basePath = BASE_URL.pathname.replace(/\/+$/, '');
+    fullPath = `${basePath}/${ep}`;
+  } else {
+    fullPath = `/api/uscis/${ep}`;
+  }
+  const url = new URL(fullPath, BASE_URL.origin);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
@@ -35,49 +44,36 @@ function makeApiUrl(endpoint, params) {
 
 const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing';
 
+// ========= UTILS =========
 function log(...args) {
   const ts = new Date().toISOString();
   console.log(`[${ts}]`, ...args);
 }
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function getJson(url, headers = {}) {
   const res = await fetch(url, { headers });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`GET ${new URL(url).pathname + new URL(url).search} failed: ${res.status} ${res.statusText} — ${text}`);
-  }
-  try { return JSON.parse(text); } catch { return {}; }
+  const body = await res.text();
+  if (!res.ok) throw new Error(`GET ${new URL(url).pathname + new URL(url).search} failed: ${res.status} ${res.statusText} — ${body}`);
+  try { return JSON.parse(body); } catch { return {}; }
 }
 
 async function postJson(url, body, headers = {}) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify(body),
-  });
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`POST ${new URL(url).pathname} failed: ${res.status} ${res.statusText} — ${text}`);
-  }
+  if (!res.ok) throw new Error(`POST ${new URL(url).pathname} failed: ${res.status} ${res.statusText} — ${text}`);
   return text;
 }
 
-// ======== API CLIENT ========
-
+// ========= API CLIENT =========
 async function fetchQueue({ force, limit } = {}) {
-  const u = makeApiUrl('/queue', { force: force ? 1 : undefined, limit });
-  log('Fetching queue from API (GET):', `${u.pathname}${u.search}`);
+  const u = makeApiUrl('queue', { force: force ? 1 : undefined, limit });
+  log('Fetching queue from API (GET):', u.toString()); // GitHub enmascara secrets; mostrar URL ayuda a depurar
   try {
     const data = await getJson(u.toString(), { Authorization: `Bearer ${API_TOKEN}` });
-    // Soporta {queue:[]} o {tramites:[]}
-    const items = Array.isArray(data.queue) ? data.queue
-                : Array.isArray(data.tramites) ? data.tramites
-                : [];
-    return items;
+    return Array.isArray(data.queue) ? data.queue
+         : Array.isArray(data.tramites) ? data.tramites
+         : [];
   } catch (err) {
     log('Queue API error (soft-fail):', String(err));
     return [];
@@ -86,18 +82,17 @@ async function fetchQueue({ force, limit } = {}) {
 
 async function reportSuccess(items) {
   if (!items.length) return;
-  const url = makeApiUrl('/report').toString();
-  await postJson(url, { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  const u = makeApiUrl('report');
+  await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
 }
 
 async function reportFailures(items) {
   if (!items.length) return;
-  const url = makeApiUrl('/report-failed').toString();
-  await postJson(url, { items }, { Authorization: `Bearer ${API_TOKEN}` });
+  const u = makeApiUrl('report-failed');
+  await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
 }
 
-// ======== CLOUDFLARE BYPASS PASIVO ========
-
+// ========= CLOUDFLARE (espera pasiva) =========
 async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
@@ -112,13 +107,8 @@ async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
       await page.locator('text=/Verifying you are human/i').first().isVisible().catch(() => false) ||
       await page.locator('#cf-please-wait, #challenge-running, iframe[src*="challenge"]').count().then(c => c > 0).catch(() => false);
 
-    if (!cfOn) {
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await sleep(800);
-    } else {
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await sleep(1500 + Math.floor(Math.random() * 900));
-    }
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await sleep(cfOn ? 1500 + Math.floor(Math.random() * 900) : 800);
   }
   return false;
 }
@@ -129,36 +119,28 @@ async function firstVisible(page, selectors = [], { timeoutPerSel = 4000 } = {})
       const el = page.locator(sel).first();
       await el.waitFor({ state: 'visible', timeout: timeoutPerSel });
       return el;
-    } catch (_) {}
+    } catch {}
   }
   return null;
 }
 
-// ======== BROWSER ========
-
+// ========= BROWSER =========
 async function launchBrowser() {
   const browser = await chromium.launch({
     headless: !HEADFUL,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-    ],
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
   });
 
   const context = await browser.newContext({
     viewport: { width: 1366, height: 768 },
     locale: 'en-US',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
     javaScriptEnabled: true,
     ignoreHTTPSErrors: true,
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
   });
 
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+  await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
 
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(90000);
@@ -167,10 +149,9 @@ async function launchBrowser() {
   return { browser, context, page };
 }
 
-// ======== SCRAPER ========
-
+// ========= SCRAPER =========
 async function scrapeOne(page, receipt) {
-  const failures = [];
+  const errors = [];
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -204,33 +185,26 @@ async function scrapeOne(page, receipt) {
 
       if (!submitBtn) throw new Error('Submit button not found');
 
-      await Promise.all([
-        page.waitForLoadState('domcontentloaded'),
-        submitBtn.click(),
-      ]);
-
+      await Promise.all([page.waitForLoadState('domcontentloaded'), submitBtn.click()]);
       await passCloudflare(page, { maxWaitMs: 45000 });
 
-      // Devolvemos HTML completo; tu backend lo parsea
       const html = await page.content();
       return { ok: true, html };
     } catch (err) {
       const html = await page.content().catch(() => '');
       const snippet = html.replace(/\s+/g, ' ').slice(0, 200);
-      const msg = `${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`;
-      failures.push(msg);
+      errors.push(`${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`);
       if (attempt < 2) await sleep(1200 + Math.floor(Math.random() * 800));
     }
   }
 
-  return { ok: false, error: failures.join(' | ') };
+  return { ok: false, error: errors.join(' | ') };
 }
 
-// ======== MAIN ========
-
+// ========= MAIN =========
 async function main() {
   log('--- Scraping Cycle Started ---');
-  log('API_BASE_URL:', BASE_URL.origin + BASE_URL.pathname.replace(/\/$/, ''));
+  log('API_BASE_URL:', BASE_URL.toString());
 
   const queue = await fetchQueue({ limit: LIMIT });
   log('Queue size:', queue.length);
@@ -241,7 +215,6 @@ async function main() {
   }
 
   const { browser, context, page } = await launchBrowser();
-
   const successes = [];
   const failures = [];
 
@@ -280,7 +253,4 @@ async function main() {
   log('--- Scraping Cycle Finished ---');
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main().catch(err => { console.error(err); process.exit(1); });
