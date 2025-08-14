@@ -1,56 +1,44 @@
 // scripts/uscis_check.cjs
 'use strict';
 
+/**
+ * Worker: USCIS scraper
+ * - Lee la cola desde la API (GET /queue?force=1&limit=N)
+ * - Visita https://egov.uscis.gov/casestatus/landing
+ * - Rellena el receipt, envía y obtiene el HTML del resultado
+ * - Reporta éxitos a POST /report y fallos a POST /report-failed
+ *
+ * Variables de entorno:
+ *  - API_BASE   (obligatorio)  e.g. https://mi-api.test/api/uscis
+ *  - API_TOKEN  (opcional)     token Bearer
+ *  - LIMIT      (opcional)     número de items por corrida
+ *  - FORCE      (opcional)     fuerza la cola (?force=1)
+ *  - HEADFUL=1  (opcional)     abre Chromium con UI (bajo xvfb en Actions)
+ *  - DEBUG=1    (opcional)     logs extra
+ */
+
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
 const { chromium } = require('playwright');
 
 // ========= ENV & CONFIG =========
-const RAW_BASE = (process.env.API_BASE || '').trim();
-const API_TOKEN = process.env.API_TOKEN || '';
-const HEADFUL = process.env.HEADFUL === '1';
-const DEBUG = process.env.DEBUG === '1';
-const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
+const RAW_BASE   = (process.env.API_BASE || '').trim();
+const API_TOKEN  = process.env.API_TOKEN || '';
+const HEADFUL    = process.env.HEADFUL === '1';
+const DEBUG      = process.env.DEBUG === '1';
+const LIMIT      = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
+const FORCE      = (process.env.FORCE || '1').trim(); // por defecto forzamos ?force=1
 
-// Por defecto forzamos queue (equivalente a ?force=1)
-const FORCE = (() => {
-  const v = (process.env.FORCE || '').trim().toLowerCase();
-  if (v === '0' || v === 'false') return false;
-  return true; // default
-})();
-
-if (!RAW_BASE || !API_TOKEN) {
-  console.error('Missing API_BASE or API_TOKEN envs.');
-  process.exit(1);
+if (!RAW_BASE) {
+  console.error('API_BASE is required.');
+  process.exit(2);
 }
 
-const BASE_IS_ABSOLUTE = /^https?:\/\//i.test(RAW_BASE);
-const BASE_URL = new URL(BASE_IS_ABSOLUTE ? RAW_BASE : `https://${RAW_BASE}`);
-const BASE_HAS_USCIS = /\/api\/uscis\/?$/i.test(BASE_URL.pathname);
-
-// Crea URL de endpoint sin perder /api/uscis cuando ya viene en la base
-function makeApiUrl(endpoint, params) {
-  const ep = String(endpoint || '').replace(/^\/+/, '');
-  let fullPath;
-  if (BASE_HAS_USCIS) {
-    const basePath = BASE_URL.pathname.replace(/\/+$/, '');
-    fullPath = `${basePath}/${ep}`;
-  } else {
-    fullPath = `/api/uscis/${ep}`;
-  }
-  const url = new URL(fullPath, BASE_URL.origin);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
-    }
-  }
-  return url;
-}
-
+const API_BASE_URL = RAW_BASE.replace(/\/+$/, ''); // sin trailing slash
 const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing';
 
-// ========= UTILS =========
+// ========= LOG/UTILS =========
 function log(...args) {
   const ts = new Date().toISOString();
   console.log(`[${ts}]`, ...args);
@@ -62,243 +50,213 @@ function errInfo(err) {
   const bits = [];
   if (err && err.message) bits.push(err.message);
   if (c && c.code) bits.push(`code=${c.code}`);
-  if (c && typeof c.statusCode === 'number') bits.push(`status=${c.statusCode}`);
-  if (c && c.syscall) bits.push(`syscall=${c.syscall}`);
-  if (c && c.hostname) bits.push(`host=${c.hostname}`);
+  if (c && c.status) bits.push(`status=${c.status}`);
   return bits.join(' ');
 }
 
-async function fetchWithRetry(doFetch, { tries = 3, baseDelay = 800 } = {}) {
-  let lastErr;
-  for (let i = 1; i <= tries; i++) {
-    try {
-      return await doFetch();
-    } catch (err) {
-      lastErr = err;
-      if (i < tries) {
-        log(`HTTP retry ${i}/${tries - 1} — ${errInfo(err)}`);
-        await sleep(baseDelay * i);
-      }
-    }
+// ========= HTTP HELPERS =========
+const defaultHeaders = () => {
+  const h = { 'Content-Type': 'application/json' };
+  if (API_TOKEN) {
+    h['Authorization'] = `Bearer ${API_TOKEN}`;
   }
-  throw lastErr;
+  return h;
+};
+
+async function httpGetJson(path) {
+  const url = `${API_BASE_URL}${path}`;
+  const res = await fetch(url, { headers: defaultHeaders(), method: 'GET' });
+  if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);
+  return res.json();
 }
 
-async function getJson(url, headers = {}) {
-  return fetchWithRetry(async () => {
-    const res = await fetch(url, { headers });
-    const body = await res.text();
-    if (!res.ok) {
-      const p = new URL(url);
-      throw new Error(`GET ${p.pathname}${p.search} failed: ${res.status} ${res.statusText} — ${body}`);
-    }
-    try { return JSON.parse(body); } catch { return {}; }
+async function httpPostJson(path, body) {
+  const url = `${API_BASE_URL}${path}`;
+  const res = await fetch(url, {
+    headers: defaultHeaders(),
+    method: 'POST',
+    body: JSON.stringify(body || {}),
   });
+  if (!res.ok) throw new Error(`POST ${path} -> ${res.status}`);
+  return res.json().catch(() => ({}));
 }
 
-async function postJson(url, body, headers = {}) {
-  return fetchWithRetry(async () => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      const p = new URL(url);
-      throw new Error(`POST ${p.pathname} failed: ${res.status} ${res.statusText} — ${text}`);
-    }
-    return text;
-  });
-}
-
-// ========= API CLIENT =========
-async function fetchQueue({ force, limit } = {}) {
-  const u = makeApiUrl('queue', { force: force ? 1 : undefined, limit });
-  log('Fetching queue from API (GET):', u.toString());
-  try {
-    const data = await getJson(u.toString(), { Authorization: `Bearer ${API_TOKEN}` });
-    if (DEBUG) {
-      try { log('Queue raw payload:', JSON.stringify(data).slice(0, 500)); } catch {}
-    }
-    return Array.isArray(data.queue) ? data.queue
-         : Array.isArray(data.tramites) ? data.tramites
-         : [];
-  } catch (err) {
-    log('Queue API error (soft-fail):', errInfo(err));
-    return [];
-  }
+// ========= API CALLS =========
+async function getQueue({ limit, force }) {
+  const q = [];
+  if (force && `${force}`.trim() !== '') q.push(`force=${encodeURIComponent(force)}`);
+  if (Number.isFinite(limit)) q.push(`limit=${limit}`);
+  const qs = q.length ? `?${q.join('&')}` : '';
+  log(`Fetching queue from API (GET): ${API_BASE_URL}/queue${qs}`);
+  const data = await httpGetJson(`/queue${qs}`);
+  if (DEBUG) log('Queue raw payload:', JSON.stringify(data));
+  const tramites = Array.isArray(data?.tramites) ? data.tramites : [];
+  log(`Queue size: ${tramites.length}`);
+  return tramites;
 }
 
 async function reportSuccess(items) {
-  if (!items.length) return;
-  const u = makeApiUrl('report');
-  try {
-    await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
-  } catch (err) {
-    log('Report success error:', errInfo(err));
-  }
+  if (!items.length) return { ok: true, skipped: 0 };
+  return httpPostJson('/report', { items });
 }
 
 async function reportFailures(items) {
-  if (!items.length) return;
-  const u = makeApiUrl('report-failed');
-  try {
-    await postJson(u.toString(), { items }, { Authorization: `Bearer ${API_TOKEN}` });
-  } catch (err) {
-    log('Report failed error:', errInfo(err));
-  }
+  if (!items.length) return { ok: true, skipped: 0 };
+  return httpPostJson('/report-failed', { items });
 }
 
-// ========= CLOUDFLARE (espera pasiva) =========
-async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
+// ========= BROWSER UTILS =========
+function buildCommonLaunchArgs() {
+  return [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+  ];
+}
+
+function buildCommonContextOptions() {
+  return {
+    viewport: { width: 1366, height: 768 },
+    locale: 'en-US',
+    // SIN userAgent hardcodeado: usar el UA real de Chromium actual
+    javaScriptEnabled: true,
+    ignoreHTTPSErrors: true,
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+  };
+}
+
+async function prepareContext(browser) {
+  const context = await browser.newContext(buildCommonContextOptions());
+  await context.addInitScript(() => {
+    // Pequeños toques “stealth”
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4] });
+  });
+  const page = await context.newPage();
+  page.setDefaultNavigationTimeout(90_000);
+  page.setDefaultTimeout(45_000);
+  return { context, page };
+}
+
+// ========= CLOUDFLARE GUARD (espera pasiva) =========
+async function passCloudflare(page, { maxWaitMs = 120_000 } = {}) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
-    const ready = await page.locator(
-      'input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]'
-    ).first().isVisible().catch(() => false);
+    // ¿Ya vemos el input de receipt?
+    const ready = await page
+      .locator('input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]')
+      .first().isVisible().catch(() => false);
     if (ready) return true;
 
-    const cfTitle = (await page.title().catch(() => '')) || '';
+    // ¿Señales de challenge?
+    const title = await page.title().catch(() => '');
     const cfOn =
-      /just a moment|verifying you are human|checking your browser/i.test(cfTitle) ||
-      await page.locator('text=/Verifying you are human/i').first().isVisible().catch(() => false) ||
-      await page.locator('#cf-please-wait, #challenge-running, iframe[src*="challenge"]').count().then(c => c > 0).catch(() => false);
+      /Just a moment|Attention Required|Security check|challenge|Verify/i.test(title) ||
+      await page.locator('text=/Verifying you are human|Just a moment|Please wait/i').first().isVisible().catch(() => false) ||
+      await page.locator('#cf-please-wait, #challenge-running').count().then(c => c > 0).catch(() => false);
 
-    await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await sleep(cfOn ? 1500 + Math.floor(Math.random() * 900) : 800);
+    // Darle tiempo al JS a que corra
+    await page.waitForLoadState('load').catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+    await sleep(cfOn ? (1500 + Math.floor(Math.random() * 900)) : 800);
   }
   return false;
 }
 
-async function firstVisible(page, selectors = [], { timeoutPerSel = 4000 } = {}) {
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      await el.waitFor({ state: 'visible', timeout: timeoutPerSel });
-      return el;
-    } catch {}
-  }
-  return null;
-}
-
-// ========= BROWSER =========
-async function launchBrowser() {
-  const browser = await chromium.launch({
-    headless: !HEADFUL,
-    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 768 },
-    locale: 'en-US',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
-    javaScriptEnabled: true,
-    ignoreHTTPSErrors: true,
-    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-  });
-
-  await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
-
-  const page = await context.newPage();
-  page.setDefaultNavigationTimeout(90000);
-  page.setDefaultTimeout(45000);
-
-  return { browser, context, page };
-}
-
 // ========= SCRAPER =========
-async function scrapeOne(page, receipt) {
-  const errors = [];
+async function scrapeOne(page, item) {
+  const receipt = (item?.receipt_number || '').trim();
+  if (!receipt) throw new Error('Missing receipt_number');
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' });
-
-      const cfOk = await passCloudflare(page, { maxWaitMs: 60000 });
-      if (!cfOk) throw new Error('Cloudflare guard did not finish in time');
-
-      const input = await firstVisible(page, [
-        'input#receipt_number',
-        'input[name="appReceiptNum"]',
-        'input[name="receiptNumber"]',
-        'input[id*="receipt"]',
-        'input[aria-label*="Receipt"]',
-      ], { timeoutPerSel: 6000 });
-
-      if (!input) {
-        const snippet = (await page.content().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200);
-        throw new Error(`Receipt input not found — ${snippet}`);
-      }
-
-      await input.fill('');
-      await input.type(receipt, { delay: 50 + Math.floor(Math.random() * 25) });
-
-      const submitBtn = await firstVisible(page, [
-        'form button[type="submit"]',
-        'button#caseStatusSearch',
-        'button:has-text("Check Status")',
-        'input[type="submit"]',
-      ], { timeoutPerSel: 4000 });
-
-      if (!submitBtn) throw new Error('Submit button not found');
-
-      await Promise.all([page.waitForLoadState('domcontentloaded'), submitBtn.click()]);
-      await passCloudflare(page, { maxWaitMs: 45000 });
-
-      const html = await page.content();
-      return { ok: true, html };
-    } catch (err) {
-      const html = await page.content().catch(() => '');
-      const snippet = html.replace(/\s+/g, ' ').slice(0, 200);
-      const msg = `${err.message || String(err)}${snippet ? ` — ${snippet}` : ''}`;
-      errors.push(msg);
-      if (attempt < 2) await sleep(1200 + Math.floor(Math.random() * 800));
-    }
+  // 1) Landing
+  await page.goto(USCIS_URL, { waitUntil: 'load' });
+  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+  const cfOk = await passCloudflare(page);
+  if (!cfOk) {
+    throw new Error('Cloudflare guard did not finish in time');
   }
 
-  return { ok: false, error: errors.join(' | ') };
+  // 2) Ingresar receipt
+  const input = page.locator('input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]').first();
+  await input.waitFor({ state: 'visible', timeout: 20_000 });
+  await input.fill('');
+  await sleep(200 + Math.floor(Math.random() * 300));
+  await input.type(receipt, { delay: 60 + Math.floor(Math.random() * 40) });
+
+  // 3) Submit
+  const submitBtn = page.locator('button[type="submit"], button:has-text("Check Status"), input[type="submit"]').first();
+  await Promise.all([
+    page.waitForLoadState('load'),
+    submitBtn.click()
+  ]);
+  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+  await passCloudflare(page);
+
+  // 4) Extra: a veces aparece un dialog o banner
+  const okBtn = page.locator('button:has-text("OK"), button:has-text("Accept"), button:has-text("I Agree")').first();
+  if (await okBtn.isVisible().catch(() => false)) {
+    await okBtn.click().catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+  }
+
+  // 5) Capturar HTML de resultado
+  const html = await page.content();
+  return {
+    tramite_id: item.tramite_id,
+    receipt_number: receipt,
+    html,
+  };
+}
+
+async function processQueue(items) {
+  const successes = [];
+  const failures = [];
+
+  // Lanzamos un browser y vamos creando contexts limpios por caso
+  const browser = await chromium.launch({ headless: !HEADFUL, args: buildCommonLaunchArgs() });
+  try {
+    for (const it of items) {
+      let context, page;
+      try {
+        log('Processing:', it.receipt_number);
+        ({ context, page } = await prepareContext(browser));
+        const result = await scrapeOne(page, it);
+        successes.push(result);
+      } catch (err) {
+        const msg = `FAIL ${it.receipt_number}: ${err.message}`;
+        log(msg, '—', errInfo(err));
+        failures.push({
+          tramite_id: it.tramite_id,
+          receipt_number: it.receipt_number,
+          error: err.message,
+        });
+      } finally {
+        if (context) await context.close().catch(() => {});
+      }
+    }
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  return { successes, failures };
 }
 
 // ========= MAIN =========
 async function main() {
   log('--- Scraping Cycle Started ---');
-  log('API_BASE_URL:', BASE_URL.toString());
+  log('API_BASE_URL:', API_BASE_URL);
 
-  const queue = await fetchQueue({ force: FORCE, limit: LIMIT });
-  log('Queue size:', queue.length);
-
+  const queue = await getQueue({ limit: LIMIT, force: FORCE });
   if (!queue.length) {
-    log('No receipts to process (or API unavailable). Exiting gracefully.');
+    log('Queue empty. Exiting.');
     return;
   }
 
-  const { browser, context, page } = await launchBrowser();
-  const successes = [];
-  const failures = [];
-
-  try {
-    for (const item of queue) {
-      const rn = item.receipt_number || item.uscis_receipt_number;
-      if (!rn) continue;
-
-      log('Processing:', rn);
-      const result = await scrapeOne(page, rn);
-
-      if (result.ok) {
-        successes.push({ tramite_id: item.tramite_id, html: result.html });
-      } else {
-        log(`FAIL ${rn}:`, result.error);
-        failures.push({ receipt_number: rn, error: result.error.slice(0, 500) });
-      }
-    }
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
+  const { successes, failures } = await processQueue(queue);
 
   if (successes.length) {
-    log(`Reporting successes: ${successes.length}`);
+    log(`Reporting successful items: ${successes.length}`);
     await reportSuccess(successes);
   } else {
     log('No successful scrapes to report.');
