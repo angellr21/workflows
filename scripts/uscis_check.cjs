@@ -3,23 +3,28 @@
 
 /**
  * Worker: USCIS scraper
- * - Lee la cola desde la API (GET /queue?force=1&limit=N)
- * - Visita https://egov.uscis.gov/casestatus/landing
- * - Rellena el receipt, envía y obtiene el HTML del resultado
- * - Reporta éxitos a POST /report y fallos a POST /report-failed
  *
- * Variables de entorno:
- *  - API_BASE   (obligatorio)  e.g. https://mi-api.test/api/uscis
- *  - API_TOKEN  (opcional)     token Bearer
- *  - LIMIT      (opcional)     número de items por corrida
- *  - FORCE      (opcional)     fuerza la cola (?force=1)
- *  - HEADFUL=1  (opcional)     abre Chromium con UI (bajo xvfb en Actions)
- *  - DEBUG=1    (opcional)     logs extra
+ * Flujo:
+ *  1) Lee la cola desde la API:   GET /queue?force=1&limit=N
+ *  2) Abre https://egov.uscis.gov/casestatus/landing
+ *  3) Ingresa receipt, envía, captura HTML de resultado
+ *  4) Reporta: POST /report (éxitos) y POST /report-failed (errores)
+ *
+ * ENV:
+ *  - API_BASE    (requerido)   e.g. https://mi-api.test/api/uscis
+ *  - API_TOKEN   (opcional)    token Bearer
+ *  - LIMIT       (opcional)    items por corrida (integer)
+ *  - FORCE       (opcional)    fuerza uso de cola (?force=1 por defecto)
+ *  - HEADFUL=1   (opcional)    Headful (UI) bajo Xvfb en GitHub Actions
+ *  - DEBUG=1     (opcional)    logs adicionales
  */
 
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { chromium } = require('playwright');
 
 // ========= ENV & CONFIG =========
@@ -28,23 +33,22 @@ const API_TOKEN  = process.env.API_TOKEN || '';
 const HEADFUL    = process.env.HEADFUL === '1';
 const DEBUG      = process.env.DEBUG === '1';
 const LIMIT      = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
-const FORCE      = (process.env.FORCE || '1').trim(); // por defecto forzamos ?force=1
+const FORCE      = (process.env.FORCE || '1').trim(); // por defecto ?force=1
 
 if (!RAW_BASE) {
   console.error('API_BASE is required.');
   process.exit(2);
 }
 
-const API_BASE_URL = RAW_BASE.replace(/\/+$/, ''); // sin trailing slash
+const API_BASE_URL = RAW_BASE.replace(/\/+$/, '');
 const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing';
 
 // ========= LOG/UTILS =========
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function log(...args) {
   const ts = new Date().toISOString();
   console.log(`[${ts}]`, ...args);
 }
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
 function errInfo(err) {
   const c = err && (err.cause || err);
   const bits = [];
@@ -57,27 +61,25 @@ function errInfo(err) {
 // ========= HTTP HELPERS =========
 const defaultHeaders = () => {
   const h = { 'Content-Type': 'application/json' };
-  if (API_TOKEN) {
-    h['Authorization'] = `Bearer ${API_TOKEN}`;
-  }
+  if (API_TOKEN) h['Authorization'] = `Bearer ${API_TOKEN}`;
   return h;
 };
 
-async function httpGetJson(path) {
-  const url = `${API_BASE_URL}${path}`;
+async function httpGetJson(pathname) {
+  const url = `${API_BASE_URL}${pathname}`;
   const res = await fetch(url, { headers: defaultHeaders(), method: 'GET' });
-  if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);
+  if (!res.ok) throw new Error(`GET ${pathname} -> ${res.status}`);
   return res.json();
 }
 
-async function httpPostJson(path, body) {
-  const url = `${API_BASE_URL}${path}`;
+async function httpPostJson(pathname, body) {
+  const url = `${API_BASE_URL}${pathname}`;
   const res = await fetch(url, {
     headers: defaultHeaders(),
     method: 'POST',
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`POST ${path} -> ${res.status}`);
+  if (!res.ok) throw new Error(`POST ${pathname} -> ${res.status}`);
   return res.json().catch(() => ({}));
 }
 
@@ -105,8 +107,8 @@ async function reportFailures(items) {
   return httpPostJson('/report-failed', { items });
 }
 
-// ========= BROWSER UTILS =========
-function buildCommonLaunchArgs() {
+// ========= PLAYWRIGHT SETUP =========
+function buildLaunchArgs() {
   return [
     '--disable-blink-features=AutomationControlled',
     '--no-sandbox',
@@ -114,52 +116,133 @@ function buildCommonLaunchArgs() {
   ];
 }
 
-function buildCommonContextOptions() {
+function buildContextOptions() {
   return {
     viewport: { width: 1366, height: 768 },
     locale: 'en-US',
-    // SIN userAgent hardcodeado: usar el UA real de Chromium actual
+    timezoneId: 'America/New_York',
+    // Importante: NO fijar userAgent -> Playwright usará el UA real de la build instalada
     javaScriptEnabled: true,
     ignoreHTTPSErrors: true,
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
   };
 }
 
-async function prepareContext(browser) {
-  const context = await browser.newContext(buildCommonContextOptions());
+async function applyStealth(context) {
   await context.addInitScript(() => {
-    // Pequeños toques “stealth”
+    // navigator.*
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4] });
+    Object.defineProperty(navigator, 'plugins',  { get: () => [1,2,3,4] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+    // window.chrome
+    window.chrome = { runtime: {} };
+
+    // Permissions API
+    const origQuery = navigator.permissions && navigator.permissions.query;
+    if (origQuery) {
+      navigator.permissions.query = (params) => {
+        if (params && params.name === 'notifications') {
+          return Promise.resolve({ state: 'denied' });
+        }
+        return origQuery(params);
+      };
+    }
+
+    // WebGL vendor/renderer
+    const patchWebGL = (proto) => {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      proto.getParameter = function(param) {
+        // 37445 = UNMASKED_VENDOR_WEBGL, 37446 = UNMASKED_RENDERER_WEBGL
+        if (param === 37445) return 'Google Inc. (Intel)';
+        if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630, D3D11)';
+        return orig.call(this, param);
+      };
+    };
+    patchWebGL(WebGLRenderingContext?.prototype);
+    patchWebGL(WebGL2RenderingContext?.prototype);
   });
-  const page = await context.newPage();
-  page.setDefaultNavigationTimeout(90_000);
-  page.setDefaultTimeout(45_000);
-  return { context, page };
 }
 
-// ========= CLOUDFLARE GUARD (espera pasiva) =========
-async function passCloudflare(page, { maxWaitMs = 120_000 } = {}) {
+function makeUserDataDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-uscis-'));
+  return dir;
+}
+
+async function launchPersistent() {
+  const userDataDir = makeUserDataDir();
+
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless: !HEADFUL,
+    args: buildLaunchArgs(),
+    ...buildContextOptions(),
+  });
+
+  await applyStealth(context);
+
+  // Página a usar durante toda la corrida
+  const page = context.pages()[0] || await context.newPage();
+  page.setDefaultNavigationTimeout(120_000);
+  page.setDefaultTimeout(60_000);
+
+  if (DEBUG) {
+    page.on('console', msg => {
+      const type = msg.type();
+      if (type === 'warning' || type === 'error') {
+        log('[page.console]', type, msg.text());
+      }
+    });
+    page.on('pageerror', e => log('[pageerror]', e.message));
+    page.on('requestfailed', req => log('[requestfailed]', req.url(), req.failure()?.errorText));
+  }
+
+  return { context, page, userDataDir };
+}
+
+// ========= CLOUDFLARE (espera pasiva con backoff) =========
+async function passCloudflare(page, { maxWaitMs = 150_000 } = {}) {
   const start = Date.now();
+  let waitMs = 1200;
+
   while (Date.now() - start < maxWaitMs) {
-    // ¿Ya vemos el input de receipt?
+    // ¿El input de receipt ya es visible?
     const ready = await page
       .locator('input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]')
-      .first().isVisible().catch(() => false);
+      .first()
+      .isVisible()
+      .catch(() => false);
     if (ready) return true;
 
-    // ¿Señales de challenge?
+    // Señales de challenge
     const title = await page.title().catch(() => '');
     const cfOn =
-      /Just a moment|Attention Required|Security check|challenge|Verify/i.test(title) ||
+      /Just a moment|Attention Required|Security check|Challenge|Verify/i.test(title) ||
       await page.locator('text=/Verifying you are human|Just a moment|Please wait/i').first().isVisible().catch(() => false) ||
-      await page.locator('#cf-please-wait, #challenge-running').count().then(c => c > 0).catch(() => false);
+      await page.locator('#cf-please-wait, #challenge-running').count().then(c => c > 0).catch(() => false) ||
+      await page.locator('iframe[title*="Cloudflare"], iframe[title*="security challenge"], iframe[src*="turnstile"]').count().then(c => c > 0).catch(() => false);
 
-    // Darle tiempo al JS a que corra
+    // Darle tiempo al JS a que evalúe
     await page.waitForLoadState('load').catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-    await sleep(cfOn ? (1500 + Math.floor(Math.random() * 900)) : 800);
+    await sleep(waitMs + Math.floor(Math.random() * 500));
+
+    // Incremental backoff suave
+    waitMs = Math.min(waitMs + 400, 3000);
+
+    // Micro acción humana: mover un poco el mouse
+    try {
+      await page.mouse.move(200 + Math.random() * 300, 300 + Math.random() * 200, { steps: 3 });
+    } catch {}
+
+    // Si no detectamos challenge visible, igualmente seguimos esperando hasta maxWaitMs
+    if (!cfOn) {
+      // pequeño respiro
+      await sleep(400);
+    }
   }
   return false;
 }
@@ -173,16 +256,14 @@ async function scrapeOne(page, item) {
   await page.goto(USCIS_URL, { waitUntil: 'load' });
   await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
   const cfOk = await passCloudflare(page);
-  if (!cfOk) {
-    throw new Error('Cloudflare guard did not finish in time');
-  }
+  if (!cfOk) throw new Error('Cloudflare guard did not finish in time');
 
   // 2) Ingresar receipt
   const input = page.locator('input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]').first();
-  await input.waitFor({ state: 'visible', timeout: 20_000 });
+  await input.waitFor({ state: 'visible', timeout: 25_000 });
   await input.fill('');
-  await sleep(200 + Math.floor(Math.random() * 300));
-  await input.type(receipt, { delay: 60 + Math.floor(Math.random() * 40) });
+  await sleep(250 + Math.floor(Math.random() * 250));
+  await input.type(receipt, { delay: 60 + Math.floor(Math.random() * 50) });
 
   // 3) Submit
   const submitBtn = page.locator('button[type="submit"], button:has-text("Check Status"), input[type="submit"]').first();
@@ -190,17 +271,10 @@ async function scrapeOne(page, item) {
     page.waitForLoadState('load'),
     submitBtn.click()
   ]);
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-  await passCloudflare(page);
+  await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => {});
+  await passCloudflare(page, { maxWaitMs: 60_000 });
 
-  // 4) Extra: a veces aparece un dialog o banner
-  const okBtn = page.locator('button:has-text("OK"), button:has-text("Accept"), button:has-text("I Agree")').first();
-  if (await okBtn.isVisible().catch(() => false)) {
-    await okBtn.click().catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
-  }
-
-  // 5) Capturar HTML de resultado
+  // 4) Capturar HTML de resultado
   const html = await page.content();
   return {
     tramite_id: item.tramite_id,
@@ -209,34 +283,32 @@ async function scrapeOne(page, item) {
   };
 }
 
-async function processQueue(items) {
+async function processQueueSequential(page, items) {
   const successes = [];
   const failures = [];
 
-  // Lanzamos un browser y vamos creando contexts limpios por caso
-  const browser = await chromium.launch({ headless: !HEADFUL, args: buildCommonLaunchArgs() });
-  try {
-    for (const it of items) {
-      let context, page;
-      try {
-        log('Processing:', it.receipt_number);
-        ({ context, page } = await prepareContext(browser));
-        const result = await scrapeOne(page, it);
-        successes.push(result);
-      } catch (err) {
-        const msg = `FAIL ${it.receipt_number}: ${err.message}`;
-        log(msg, '—', errInfo(err));
-        failures.push({
-          tramite_id: it.tramite_id,
-          receipt_number: it.receipt_number,
-          error: err.message,
-        });
-      } finally {
-        if (context) await context.close().catch(() => {});
+  for (const it of items) {
+    try {
+      log('Processing:', it.receipt_number);
+      const result = await scrapeOne(page, it);
+      successes.push(result);
+
+      // Pausa ligera entre casos (reduce ritmo “robótico”)
+      await sleep(1200 + Math.floor(Math.random() * 800));
+    } catch (err) {
+      const msg = `FAIL ${it.receipt_number}: ${err.message}`;
+      log(msg, '—', errInfo(err));
+      failures.push({
+        tramite_id: it.tramite_id,
+        receipt_number: it.receipt_number,
+        error: err.message,
+      });
+
+      // Si falló por Cloudflare, espera más antes del próximo intento
+      if (/Cloudflare/i.test(err.message)) {
+        await sleep(4000 + Math.floor(Math.random() * 3000));
       }
     }
-  } finally {
-    await browser.close().catch(() => {});
   }
 
   return { successes, failures };
@@ -253,18 +325,28 @@ async function main() {
     return;
   }
 
-  const { successes, failures } = await processQueue(queue);
+  // Contexto PERSISTENTE para mantener cookies del guard
+  const { context, page, userDataDir } = await launchPersistent();
+  try {
+    const { successes, failures } = await processQueueSequential(page, queue);
 
-  if (successes.length) {
-    log(`Reporting successful items: ${successes.length}`);
-    await reportSuccess(successes);
-  } else {
-    log('No successful scrapes to report.');
-  }
+    if (successes.length) {
+      log(`Reporting successful items: ${successes.length}`);
+      await reportSuccess(successes);
+    } else {
+      log('No successful scrapes to report.');
+    }
 
-  if (failures.length) {
-    log(`Reporting failed items: ${failures.length}`);
-    await reportFailures(failures);
+    if (failures.length) {
+      log(`Reporting failed items: ${failures.length}`);
+      await reportFailures(failures);
+    }
+  } finally {
+    await context.close().catch(() => {});
+    // Limpieza del perfil temporal
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    } catch {}
   }
 
   log('--- Scraping Cycle Finished ---');
