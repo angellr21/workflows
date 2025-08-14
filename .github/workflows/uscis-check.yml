@@ -3,7 +3,7 @@ name: USCIS Case Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"  # cada hora (ajústalo si quieres)
+    - cron: "0 * * * *"  # cada hora
 
 concurrency:
   group: uscis-checker
@@ -26,18 +26,16 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Playwright (Chromium + deps)
         run: npx playwright install --with-deps chromium
 
-      # Ejecutar en modo HEADFUL bajo Xvfb para ayudar a pasar Cloudflare
       - name: Run scraper (headed via Xvfb)
         env:
           API_BASE: ${{ secrets.API_BASE }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
-          HEADFUL: "1"     # <- clave para que el script levante el browser "visible"
+          HEADFUL: "1"
           DEBUG: "0"
-          # Opcionales:
           # LIMIT: "10"
         run: xvfb-run -a npm run check
