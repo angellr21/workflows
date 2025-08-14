@@ -13,12 +13,17 @@ const HEADFUL = process.env.HEADFUL === '1';
 const DEBUG = process.env.DEBUG === '1';
 const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
 
-// Por defecto forzamos queue (equivalente a ?force=1)
+// Por defecto forzamos queue (?force=1) salvo que se pida desactivarlo con FORCE=0
 const FORCE = (() => {
   const v = (process.env.FORCE || '').trim().toLowerCase();
   if (v === '0' || v === 'false') return false;
   return true; // default
 })();
+
+// Tiempo máximo para esperar el guard de Cloudflare (override con env CF_MAX_WAIT_MS)
+const CF_MAX_WAIT_MS = process.env.CF_MAX_WAIT_MS
+  ? parseInt(process.env.CF_MAX_WAIT_MS, 10)
+  : 180000; // 3 minutos por defecto
 
 if (!RAW_BASE || !API_TOKEN) {
   console.error('Missing API_BASE or API_TOKEN envs.');
@@ -151,21 +156,28 @@ async function reportFailures(items) {
 }
 
 // ========= CLOUDFLARE (espera pasiva) =========
-async function passCloudflare(page, { maxWaitMs = 60000 } = {}) {
+async function passCloudflare(page, { maxWaitMs = CF_MAX_WAIT_MS } = {}) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
+    // 1) ¿Ya está el input visible?
     const ready = await page.locator(
       'input#receipt_number, input[name="appReceiptNum"], input[name="receiptNumber"], input[id*="receipt"]'
     ).first().isVisible().catch(() => false);
     if (ready) return true;
 
+    // 2) Señales de challenge activo
     const cfTitle = (await page.title().catch(() => '')) || '';
     const cfOn =
       /just a moment|verifying you are human|checking your browser/i.test(cfTitle) ||
       await page.locator('text=/Verifying you are human/i').first().isVisible().catch(() => false) ||
-      await page.locator('#cf-please-wait, #challenge-running, i...src*="challenge"]').count().then(c => c > 0).catch(() => false);
+      await page.locator('#cf-please-wait, #challenge-running, [id*="turnstile"]').count().then(c => c > 0).catch(() => false);
 
+    // 3) Avanza el ciclo de carga y espera un poco (con jitter)
     await page.waitForLoadState('domcontentloaded').catch(() => {});
+    if (!cfOn) {
+      // Deja que scripts de la página acaben peticiones de verificación
+      await page.waitForLoadState('networkidle').catch(() => {});
+    }
     await sleep(cfOn ? 1500 + Math.floor(Math.random() * 900) : 800);
   }
   return false;
@@ -186,23 +198,32 @@ async function firstVisible(page, selectors = [], { timeoutPerSel = 4000 } = {})
 async function launchBrowser() {
   const browser = await chromium.launch({
     headless: !HEADFUL,
-    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+    ],
   });
 
   const context = await browser.newContext({
     viewport: { width: 1366, height: 768 },
     locale: 'en-US',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
+    timezoneId: 'America/New_York',
+    // Alineamos UA con Chromium 139 que descarga Playwright en GH Actions
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     javaScriptEnabled: true,
     ignoreHTTPSErrors: true,
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
   });
 
-  await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
 
   const page = await context.newPage();
-  page.setDefaultNavigationTimeout(90000);
-  page.setDefaultTimeout(45000);
+  // Timeouts más generosos para acompañar Cloudflare
+  page.setDefaultNavigationTimeout(180000);
+  page.setDefaultTimeout(120000);
 
   return { browser, context, page };
 }
@@ -215,7 +236,8 @@ async function scrapeOne(page, receipt) {
     try {
       await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' });
 
-      const cfOk = await passCloudflare(page, { maxWaitMs: 60000 });
+      // Espera extendida y configurable para que Cloudflare complete su challenge
+      const cfOk = await passCloudflare(page, { maxWaitMs: CF_MAX_WAIT_MS });
       if (!cfOk) throw new Error('Cloudflare guard did not finish in time');
 
       const input = await firstVisible(page, [
@@ -243,8 +265,14 @@ async function scrapeOne(page, receipt) {
 
       if (!submitBtn) throw new Error('Submit button not found');
 
-      await Promise.all([page.waitForLoadState('domcontentloaded'), submitBtn.click()]);
-      await passCloudflare(page, { maxWaitMs: 45000 });
+      await Promise.all([
+        page.waitForLoadState('domcontentloaded'),
+        submitBtn.click()
+      ]);
+
+      // Tras enviar, puede volver a dispararse un mini-guard
+      await passCloudflare(page, { maxWaitMs: Math.min(60000, CF_MAX_WAIT_MS) });
+      await page.waitForLoadState('networkidle').catch(() => {});
 
       const html = await page.content();
       return { ok: true, html };
@@ -286,10 +314,16 @@ async function main() {
       const result = await scrapeOne(page, rn);
 
       if (result.ok) {
-        successes.push({ tramite_id: item.tramite_id, html: result.html });
+        successes.push({
+          tramite_id: item.tramite_id,
+          html: result.html,
+        });
       } else {
         log(`FAIL ${rn}:`, result.error);
-        failures.push({ receipt_number: rn, error: result.error.slice(0, 500) });
+        failures.push({
+          receipt_number: rn,
+          error: result.error.slice(0, 500),
+        });
       }
     }
   } finally {
@@ -312,4 +346,7 @@ async function main() {
   log('--- Scraping Cycle Finished ---');
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
