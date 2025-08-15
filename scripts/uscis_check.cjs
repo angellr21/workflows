@@ -1,284 +1,348 @@
 #!/usr/bin/env node
-'use strict';
-
-/**
- * USCIS checker con Playwright (Chrome del sistema).
- * - Usa API_BASE/ API_TOKEN (Bearer) para leer cola y reportar resultados.
- * - Soporta proxy vía PROXY_*.
- * - Reintenta navegaciones y maneja microcortes de red.
- */
-
+/* eslint-disable no-console */
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
-const { chromium, devices } = require('playwright');
+const { chromium } = require('playwright'); // instalada vía npm
 
-// ======== ENV ========
-const ENV = (k, d='') => (process.env[k] ?? d);
-const API_BASE   = ENV('API_BASE').replace(/\/+$/,''); // sin slash final
-const API_TOKEN  = ENV('API_TOKEN');
-const PROXY_ON   = /^(1|true|yes)$/i.test(ENV('PROXY_ENABLED'));
-const PROXY_HOST = ENV('PROXY_HOST');
-const PROXY_PORT = ENV('PROXY_PORT');
-const PROXY_USER = ENV('PROXY_USERNAME');
-const PROXY_PASS = ENV('PROXY_PASSWORD');
-const HEADFUL    = /^(1|true|yes)$/i.test(ENV('HEADFUL', '0'));
-const BROWSER    = ENV('BROWSER', 'chrome-channel'); // 'chrome-channel' | 'chromium'
-const NAV_TIMEOUT_MS = parseInt(ENV('NAV_TIMEOUT_MS', '90000'), 10); // 90s
+// -------------------- util de log --------------------
+function ts() { return new Date().toISOString(); }
+function log(...a) { console.log(`[${ts()}]`, ...a); }
+function warn(...a) { console.warn(`[${ts()}] [warn]`, ...a); }
+function err(...a) { console.error(`[${ts()}] [error]`, ...a); }
 
-if (!API_BASE || !API_TOKEN) {
-  console.error('[fatal] Falta API_BASE o API_TOKEN en variables de entorno.');
-  process.exit(2);
+// -------------------- config --------------------
+const CFG = {
+  API_BASE: (process.env.API_BASE || '').replace(/\/+$/, ''),
+  API_TOKEN: process.env.API_TOKEN || '',
+  QUEUE_PATH: (process.env.API_QUEUE_PATH || '/queue').replace(/^\/?/, '/'),
+  RESULT_PATH: (process.env.API_RESULT_PATH || '/result').replace(/^\/?/, '/'),
+
+  BROWSER: process.env.BROWSER || 'chrome-channel',
+  HEADFUL: process.env.HEADFUL === '1',
+  MAX_ATTEMPTS_CASE: 3,
+  NAV_TIMEOUT_MS: 120_000,
+  SELECTOR_TIMEOUT_MS: 90_000,
+
+  PROXY: (process.env.PROXY_ENABLED && process.env.PROXY_ENABLED !== '0') ? {
+    server: process.env.PROXY_HOST && process.env.PROXY_PORT
+      ? `${process.env.PROXY_HOST}:${process.env.PROXY_PORT}` : undefined,
+    username: process.env.PROXY_USERNAME || undefined,
+    password: process.env.PROXY_PASSWORD || undefined
+  } : null
+};
+
+if (!CFG.API_BASE) {
+  err('API_BASE no definido. Exporta el secreto API_BASE.');
+  process.exit(1);
 }
 
-// ======== LOGS ========
-const logsDir = path.join(process.cwd(), 'logs');
-if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-const runTag = new Date().toISOString().replace(/[:.]/g, '-');
-const logFile = path.join(logsDir, `run-${runTag}.log`);
-function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
-  console.log(line);
-  try { fs.appendFileSync(logFile, line + '\n'); } catch {}
-}
+const OUT_DIRS = ['logs', 'screenshots', 'pages', 'playwright-report'];
+for (const d of OUT_DIRS) fs.mkdirSync(d, { recursive: true });
 
-// ======== Helpers HTTP ========
-async function fetchJSON(url, { method='GET', headers={}, body, timeout=20000 } = {}) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeout);
-  const res = await fetch(url, {
-    method,
-    headers: {
-      'accept': 'application/json',
-      ...(body ? {'content-type': 'application/json'} : {}),
-      authorization: `Bearer ${API_TOKEN}`,
-      ...headers,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: ctrl.signal,
-  }).catch(err => {
-    clearTimeout(id);
-    throw new Error(`HTTP fetch error: ${err.message}`);
-  });
-  clearTimeout(id);
-
-  const text = await res.text();
+// -------------------- helpers HTTP --------------------
+async function fetchJSON(url, options = {}) {
+  const headers = {
+    'content-type': 'application/json',
+    ...(options.headers || {})
+  };
+  // Incluye token si existe
+  if (CFG.API_TOKEN) {
+    headers['Authorization'] = `Bearer ${CFG.API_TOKEN}`;
+    headers['X-API-TOKEN'] = CFG.API_TOKEN; // por compatibilidad
+  }
+  const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}: ${text.slice(0,1000)}`);
+    const text = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${res.statusText}: ${text.slice(0, 1500)}`);
   }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Invalid JSON from ${url}: ${text.slice(0,200)}`);
-  }
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : res.text();
 }
 
-async function postJSON(url, payload) {
-  return fetchJSON(url, { method: 'POST', body: payload, timeout: 30000 });
+function qURL(pathname) {
+  return `${CFG.API_BASE}${pathname}`;
 }
 
-// ======== Conectividad y reintentos ========
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// Probador de varios endpoints de resultado (por el 404 que muestras)
+async function postResultWithFallback(payload) {
+  const candidates = [
+    CFG.RESULT_PATH,               // p.ej. /result        (por defecto)
+    '/uscis/result',               // alternativa común
+    '/api/uscis/result'            // la que aparece en tu 404
+  ];
 
-async function probeInternet() {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    const res = await fetch('https://www.google.com/generate_204', { signal: ctrl.signal });
-    clearTimeout(t);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function gotoWithRetries(page, url, { attempts=3, timeout=NAV_TIMEOUT_MS } = {}) {
-  for (let i = 1; i <= attempts; i++) {
+  let lastErr;
+  for (const p of candidates) {
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
-      return;
-    } catch (err) {
-      log(`[warn] goto attempt ${i}/${attempts} failed: ${err.message}`);
-      if (i === attempts) throw err;
-
-      const netOk = await probeInternet();
-      if (!netOk) {
-        log('[warn] Connectivity probe failed; waiting 10s before retry…');
-        await sleep(10_000);
+      const url = qURL(p);
+      log(`POST -> ${url}`);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(CFG.API_TOKEN ? { 'Authorization': `Bearer ${CFG.API_TOKEN}`, 'X-API-TOKEN': CFG.API_TOKEN } : {})
+        },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok || res.status === 204) {
+        return true;
       }
-      await sleep(5000 * i); // backoff
+      const txt = await res.text();
+      throw new Error(`HTTP ${res.status} ${res.statusText}: ${txt.slice(0, 1500)}`);
+    } catch (e) {
+      lastErr = e;
+      warn(`POST ${p} falló: ${e.message}`);
     }
   }
+  throw lastErr;
 }
 
-// ======== API ========
-async function getQueue() {
-  const url = `${API_BASE}/queue`;
-  log(`Fetching queue from API (GET): ${url}`);
-  const data = await fetchJSON(url, { timeout: 25000 });
-  log(`Queue raw payload: ${JSON.stringify(data).slice(0,500)}`);
-  const arr = Array.isArray(data) ? data
-            : Array.isArray(data?.tramites) ? data.tramites
-            : [];
-  return arr.map(x => ({
-    tramite_id: x.tramite_id ?? x.id ?? null,
-    receipt_number: String(x.receipt_number ?? x.receipt ?? '').trim(),
-    fail_count: x.fail_count ?? 0,
-  })).filter(x => x.receipt_number);
-}
-
-async function sendResult(payload) {
-  const url = `${API_BASE}/result`;
-  try {
-    await postJSON(url, payload);
-  } catch (e) {
-    log(`[warn] POST ${url} falló: ${e.message}`);
+// -------------------- Playwright setup --------------------
+async function locateChrome() {
+  const candidates = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable'];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
   }
+  return null;
 }
 
-// ======== Playwright (Chrome del sistema) ========
-function buildProxy() {
-  if (!PROXY_ON || !PROXY_HOST || !PROXY_PORT) return undefined;
-  const server = `http://${PROXY_HOST}:${PROXY_PORT}`;
-  return {
-    server,
-    username: PROXY_USER || undefined,
-    password: PROXY_PASS || undefined,
-  };
+function randomUA() {
+  // UA "normal" de escritorio (Chrome en Windows)
+  const ver =  119 + Math.floor(Math.random() * 20);
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${ver}.0.0.0 Safari/537.36`;
 }
 
-async function launchContext() {
-  const userDataDir = path.join(os.homedir(), '.cache', 'playwright-chrome-profile');
-  const proxy = buildProxy();
-  const useChromeChannel = (BROWSER || '').toLowerCase().includes('chrome');
+// -------------------- USCIS scraping --------------------
+const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing.do';
 
-  const launchOptions = {
-    headless: !HEADFUL,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--window-size=1366,768',
-      '--enable-unsafe-swiftshader',
-    ],
-    proxy: proxy,
-    channel: useChromeChannel ? 'chrome' : undefined,
-  };
+const RECEIPT_INPUTS = [
+  'input[name="appReceiptNum"]',
+  'input[name="receiptNumber"]',
+  'input#receipt_number',
+  'input#receiptNumber',
+  'input[name="caseStatusSearchInput"]'
+].join(', ');
 
-  log(`Browser in use: ${useChromeChannel ? 'chrome-channel' : 'chromium'} | headful: ${HEADFUL ? 'yes' : 'no'} | proxy:${proxy ? 'on' : 'off'}`);
+const SUBMIT_BUTTONS = [
+  'button[type="submit"]',
+  'input[type="submit"]',
+  'button:has-text("CHECK STATUS")',
+  'button:has-text("Check Status")'
+].join(', ');
 
-  const context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+const BLOCK_MARKERS = [
+  'text=Access denied',
+  'text=Attention Required! | Cloudflare',
+  'text=Please verify you are a human',
+  '#cf-chl-widget',
+  'iframe[title*="challenge"]'
+];
+
+async function saveArtifacts(prefix, page) {
+  try {
+    const html = await page.content();
+    fs.writeFileSync(path.join('pages', `${prefix}.html`), html, 'utf8');
+  } catch {}
+  try {
+    await page.screenshot({ path: path.join('screenshots', `${prefix}.png`), fullPage: true });
+  } catch {}
+}
+
+async function openContext() {
+  const executablePath = await locateChrome();
+  const args = [
+    '--no-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-blink-features=AutomationControlled',
+    '--force-color-profile=srgb'
+  ];
+
+  const context = await chromium.launchPersistentContext(
+    path.join('.pw-profile'),
+    {
+      headless: !CFG.HEADFUL ? true : false,
+      channel: executablePath ? undefined : 'chrome', // si no hay binario, usa channel
+      executablePath: executablePath || undefined,
+      args,
+      viewport: { width: 1366, height: 768 },
+      locale: 'en-US',
+      colorScheme: 'light',
+      userAgent: randomUA(),
+      proxy: CFG.PROXY?.server ? {
+        server: CFG.PROXY.server,
+        username: CFG.PROXY.username,
+        password: CFG.PROXY.password
+      } : undefined,
+    }
+  );
+
+  // "stealth" básico
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    // WebGL/Plugins mínimos
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+  });
+
   const page = await context.newPage();
-  page.setDefaultTimeout(NAV_TIMEOUT_MS);
-  page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-
-  // Simular un viewport decente
-  await page.setViewportSize({ width: 1366, height: 768 });
-
+  page.setDefaultNavigationTimeout(CFG.NAV_TIMEOUT_MS);
+  page.setDefaultTimeout(CFG.SELECTOR_TIMEOUT_MS);
   return { context, page };
 }
 
-// ======== Scraping USCIS ========
-const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing.do';
+async function ensureReady(page, attempt) {
+  // Abre y espera a input o marca de bloqueo
+  await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' });
 
-async function extractStatusText(page) {
-  // Busca en varios selectores comunes de la página de resultado
-  const selectors = [
-    '#caseStatus h1',
-    'div.current-status-sec h1',
-    '.rows .current-status-title',
-    'h1',
-    'h2',
-  ];
-  for (const sel of selectors) {
-    const el = page.locator(sel).first();
-    if (await el.count()) {
-      const txt = (await el.textContent() || '').trim();
-      if (txt) return txt;
+  // Corre una "carrera" entre: selector de recibo, bloqueos, o 10s y luego intenta la ruta "mycasestatus"
+  const blocker = Promise.any(BLOCK_MARKERS.map(sel => page.waitForSelector(sel, { timeout: 8_000 })))
+    .then(() => 'blocked')
+    .catch(() => null);
+
+  const receipt = page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 12_000 })
+    .then(() => 'ok')
+    .catch(() => null);
+
+  let outcome = await Promise.race([blocker, receipt, new Promise(r => setTimeout(() => r('timeout'), 10_000))]);
+
+  if (outcome === 'blocked' || outcome === 'timeout') {
+    // plan B: otra ruta conocida
+    await page.goto('https://egov.uscis.gov/casestatus/mycasestatus.do', { waitUntil: 'domcontentloaded' });
+    try {
+      await page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 15_000 });
+      outcome = 'ok';
+    } catch {
+      outcome = outcome || 'blocked';
     }
   }
-  // fallback: un fragmento de la página
-  const html = await page.content();
-  return (html || '').slice(0, 300);
+
+  if (outcome !== 'ok') {
+    await saveArtifacts(`blocked_attempt${attempt}`, page);
+    throw new Error('Bloqueo/desafío o input no disponible');
+  }
 }
 
-async function checkReceipt(page, receipt) {
-  await gotoWithRetries(page, USCIS_URL);
+async function checkCase(page, receipt, attempt) {
+  await ensureReady(page, attempt);
 
-  // Encuentra input del número (varía de vez en cuando)
-  const input = page.locator([
-    'input[name="receiptNumber"]',
-    'input#receipt_number',
-    'input#receiptNumber',
-    'input[name="caseStatusSearchInput"]',
-    'input[name="appReceiptNum"]',
-  ].join(', ')).first();
+  const input = page.locator(RECEIPT_INPUTS).first();
+  await input.fill('');
+  await input.type(receipt, { delay: 30 });
 
-  await input.waitFor({ state: 'visible' });
-  await input.fill(receipt);
+  const beforeNav = page.url();
+  // dispara: algunos sitios usan submit del form
+  const btn = page.locator(SUBMIT_BUTTONS).first();
+  if (await btn.isVisible().catch(() => false)) {
+    await Promise.all([
+      page.waitForLoadState('domcontentloaded'),
+      btn.click()
+    ]);
+  } else {
+    await page.keyboard.press('Enter');
+    await page.waitForLoadState('domcontentloaded');
+  }
 
-  // Botón "Check Status"
-  const btn = page.locator([
-    'button:has-text("Check Status")',
-    'button:has-text("CHECK STATUS")',
-    'input[type="submit"]',
-    '#caseStatusSearchBtn'
-  ].join(', ')).first();
+  // Espera alguno de los contenedores de resultado conocidos:
+  const RESULT_SELECTORS = [
+    'h1:has-text("Case ")',              // "Case Was Received", etc.
+    '.current-status-sec',               // contenedor clásico
+    '.rows .text-center h1',             // variaciones
+    'div:has-text("Your Current Case Status")'
+  ];
 
-  // Espera navegación o cambio de contenido
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded'),
-    btn.click()
-  ]);
+  const found = await Promise.any(
+    RESULT_SELECTORS.map(sel => page.waitForSelector(sel, { timeout: CFG.SELECTOR_TIMEOUT_MS }))
+  ).catch(() => null);
 
-  // A veces el contenido se renderiza un pelín tarde:
-  await page.waitForTimeout(1500);
+  if (!found) {
+    await saveArtifacts(`noresult_${receipt}_attempt${attempt}`, page);
+    throw new Error('No se detectó el bloque de resultado');
+  }
 
-  const status = await extractStatusText(page);
-  return status;
+  // Extrae resumen
+  const titleNode = await page.locator('h1').first();
+  const title = (await titleNode.textContent().catch(() => '') || '').trim();
+  const body = (await page.locator('div, p').allTextContents().catch(() => [])).join('\n').slice(0, 5000);
+
+  return {
+    receipt_number: receipt,
+    status_title: title,
+    status_excerpt: body
+  };
 }
 
-// ======== MAIN ========
+// -------------------- flujo principal --------------------
+async function getQueue() {
+  const url = qURL(CFG.QUEUE_PATH);
+  log(`Fetching queue from API (GET): ${url}`);
+  const data = await fetchJSON(url);
+  try { log('Queue raw payload:', JSON.stringify(data)); } catch {}
+  const list = (data?.tramites || []).map(x => ({
+    tramite_id: x.tramite_id ?? x.id ?? null,
+    receipt_number: String(x.receipt_number || x.case || '').trim(),
+    fail_count: x.fail_count ?? 0
+  })).filter(x => x.receipt_number);
+  log(`Queue size: ${list.length}`);
+  return list;
+}
+
 async function main() {
+  console.log('>>> Intento 1');
   log('--- Scraping Cycle Started ---');
-  log(`API_BASE_URL: ${API_BASE}`);
+  log(`API_BASE_URL: ${CFG.API_BASE}`);
 
   const queue = await getQueue();
-  log(`Queue size: ${queue.length}`);
+  if (!queue.length) {
+    log('No hay elementos en la cola. Fin.');
+    return;
+  }
 
-  const { context, page } = await launchContext();
+  const { context, page } = await openContext();
+  log(`Browser in use: ${CFG.BROWSER} | headful: ${CFG.HEADFUL ? 'yes' : 'no'} | proxy:${CFG.PROXY ? 'on' : 'off'}`);
 
-  try {
-    for (const item of queue) {
-      const rn = item.receipt_number;
-      log(`Processing: ${rn}`);
+  for (const item of queue) {
+    const { receipt_number, tramite_id } = item;
+    log(`Processing: ${receipt_number}`);
+
+    let result = null;
+    let ok = false;
+    for (let attempt = 1; attempt <= CFG.MAX_ATTEMPTS_CASE; attempt++) {
       try {
-        const statusText = await checkReceipt(page, rn);
-        log(`[ok] ${rn}: ${statusText}`);
-        await sendResult({
-          ok: true,
-          tramite_id: item.tramite_id,
-          receipt_number: rn,
-          status_text: statusText,
-          checked_at: new Date().toISOString()
-        });
-      } catch (err) {
-        log(`[error] ${rn} failed: ${err.message}`);
-        await sendResult({
-          ok: false,
-          tramite_id: item.tramite_id,
-          receipt_number: rn,
-          error: String(err.message || err),
-          checked_at: new Date().toISOString()
-        });
+        result = await checkCase(page, receipt_number, attempt);
+        ok = true;
+        break;
+      } catch (e) {
+        err(`${receipt_number} failed: ${e.message}`);
+        // backoff progresivo
+        await new Promise(r => setTimeout(r, 3000 * attempt));
+        // recarga dura entre intentos
+        try { await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' }); } catch {}
       }
     }
-  } finally {
-    await context.close();
+
+    // arma payload y envía
+    const payload = {
+      tramite_id,
+      receipt_number,
+      ok,
+      ...(result || {}),
+      ts: new Date().toISOString()
+    };
+
+    try {
+      await postResultWithFallback(payload);
+    } catch (e) {
+      warn(`POST ${qURL(CFG.RESULT_PATH)} falló: ${e.message}`);
+    }
   }
+
+  await page.close().catch(() => {});
+  await context.close().catch(() => {});
 }
 
-main().catch(err => {
-  log(`[fatal] ${err.stack || err.message || String(err)}`);
+main().catch(async (e) => {
+  err(e.stack || e.message || String(e));
+  try { fs.writeFileSync(`run-${Date.now()}.log`, `${e.stack || e}`); } catch {}
   process.exit(1);
 });
