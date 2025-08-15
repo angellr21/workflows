@@ -1,0 +1,30 @@
+name: USCIS Check (Self-hosted)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  run-check:
+    runs-on: [self-hosted, Linux, X64]  # apunta al runner que tienes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Instalar dependencias del proyecto
+        run: npm ci
+
+      # Si tu código usa canal "chrome", basta con esto:
+      - name: Instalar navegadores de Playwright
+        run: npx playwright install chrome
+
+      - name: Ejecutar el check con Xvfb
+        run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
+        env:
+          API_BASE: ${{ secrets.API_BASE }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
