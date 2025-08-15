@@ -3,7 +3,8 @@ name: USCIS Case Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"  # ejecuta cada hora (ajusta a gusto)
+    # Corre cada hora
+    - cron: "0 * * * *"
 
 concurrency:
   group: uscis-checker
@@ -12,34 +13,47 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"   # <-- sin 'cache: npm' para evitar el error de lockfile
+          node-version: "20.x"
+          # Importante: no activar cache npm si no tienes package-lock.json
+          # cache: "npm"
 
       - name: Install dependencies
         run: |
           if [ -f package-lock.json ]; then
-            npm ci
+            npm ci --no-audit --no-fund
           else
-            npm install --no-audit --no-fund
+            npm i --no-audit --no-fund
           fi
 
-      - name: Install Playwright (Chromium + system deps)
-        run: npx playwright install --with-deps chromium
+      - name: Install Playwright (Chrome + system deps)
+        run: npx playwright install --with-deps chrome
 
-      - name: Run scraper (headful via Xvfb)
+      # Opcional: instala Chromium como fallback (puedes comentar esta línea si prefieres)
+      # - name: Install Playwright (Chromium fallback)
+      #   run: npx playwright install --with-deps chromium
+
+      - name: Run scraper (headful bajo Xvfb usando canal Chrome)
         env:
           API_BASE: ${{ secrets.API_BASE }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
-          LIMIT: "10"     # opcional
-          FORCE: ""       # opcional
-          HEADFUL: "1"    # fuerza modo headful (mitiga algunos guards)
-          DEBUG: "1"      # logs extra para diagnóstico
-        run: xvfb-run -a npm run check
+          LIMIT: "10"
+          FORCE: "1"
+          HEADFUL: "1"
+          USE_CHROME: "1"    # fuerza el canal 'chrome' en el script
+          DEBUG: "1"
+
+          # Soporte de proxy (deja en blanco si no usas):
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+
+        run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
