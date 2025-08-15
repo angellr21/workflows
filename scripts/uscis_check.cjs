@@ -1,286 +1,383 @@
 #!/usr/bin/env node
-/* eslint-disable no-console */
-//
-// USCIS checker (self-hosted friendly)
-// - Usa Google Chrome del sistema (sin descargar navegadores de Playwright)
-// - Respeta HEADFUL=1 para modo visible (con xvfb en Actions)
-// - Proxy opcional via PROXY_*
-//
-// Env esperadas (ejemplos):
-//   API_BASE="https://tu.api"          (obligatorio)
-//   API_TOKEN="xxxxx"                  (opcional, Bearer)
-//   HEADFUL="1"                        (opcional; 1 = con UI; por defecto headless)
-//   BROWSER="chrome-channel"           (opcional; se ignora si CHROME_PATH está presente)
-//   CHROME_PATH="/usr/bin/google-chrome" (se exporta en el workflow)
-//   PROXY_ENABLED="1" PROXY_HOST="host" PROXY_PORT="8080" PROXY_USERNAME="u" PROXY_PASSWORD="p" (opcionales)
-//
-// Notas:
-// - Si quieres seguir usando exactamente tu scraping anterior, reemplaza el cuerpo de
-//   `runCheckForReceipt()` por tu lógica original. El resto ya gestiona Chrome del sistema.
-//
+'use strict';
 
-const { chromium } = require('playwright');
-const { execFileSync } = require('child_process');
-const os = require('os');
+/**
+ * USCIS checker – autómata Playwright para leer cola desde API y reportar resultados.
+ * Node 20+, Playwright 1.44+ (funciona con Chrome del sistema).
+ */
+
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { chromium } = require('playwright');
 
-// ---------- Utils de logging ----------
-function ts() {
-  return new Date().toISOString();
-}
-function log(msg) {
-  console.log(`[${ts()}] ${msg}`);
-}
-
-// ---------- ENV ----------
+// =======================
+// Config / Entorno
+// =======================
 const API_BASE = process.env.API_BASE || process.env.API_BASE_URL || '';
 const API_TOKEN = process.env.API_TOKEN || '';
-const HEADFUL = process.env.HEADFUL === '1';
-const BROWSER_ENV = process.env.BROWSER || ''; // p.ej. "chrome-channel"
-const PROXY_ENABLED = !!process.env.PROXY_ENABLED;
+const PROXY_ENABLED = String(process.env.PROXY_ENABLED || '').trim();
+const PROXY_HOST = process.env.PROXY_HOST || '';
+const PROXY_PORT = process.env.PROXY_PORT || '';
+const PROXY_USERNAME = process.env.PROXY_USERNAME || '';
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || '';
+const QUEUE_LIMIT = process.env.QUEUE_LIMIT ? Number(process.env.QUEUE_LIMIT) : null;
+const HEADFUL = String(process.env.HEADFUL || '') === '1';
+const BROWSER = (process.env.BROWSER || 'chromium').toLowerCase(); // ej: "chrome-channel" | "chromium"
+const NODE_ENV = process.env.NODE_ENV || 'production';
 
-// ---------- Helpers ----------
-function findChromeSync() {
-  const explicit = process.env.CHROME_PATH && process.env.CHROME_PATH.trim();
-  const candidates = [
-    explicit,
-    'google-chrome',
-    'google-chrome-stable',
-    'chromium-browser',
-    'chromium'
-  ].filter(Boolean);
+// carpetas de salida (logs, screenshots, report)
+const OUT_BASE = path.resolve(process.cwd());
+const LOG_DIR = path.join(OUT_BASE, 'logs');
+const SHOT_DIR = path.join(LOG_DIR, 'screens');
+fs.mkdirSync(LOG_DIR, { recursive: true });
+fs.mkdirSync(SHOT_DIR, { recursive: true });
 
-  for (const c of candidates) {
-    try {
-      const p = execFileSync('which', [c], { encoding: 'utf8' }).trim();
-      if (p) return p;
-    } catch {
-      // ignore
-    }
-  }
-  return null;
-}
+// =======================
+// Utilidades
+// =======================
+const ts = () => new Date().toISOString();
+const log = (...a) => console.log(`[${ts()}]`, ...a);
+const warn = (...a) => console.warn(`[${ts()}] [warn]`, ...a);
+const terr = (...a) => console.error(`[${ts()}] [error]`, ...a);
 
-async function createBrowserContext() {
-  const userDataDir = path.join(os.homedir(), '.uscis-chrome-profile');
-
-  /** @type {import('playwright').LaunchPersistentContextOptions} */
-  const common = {
-    headless: !HEADFUL,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-web-security',
-      '--mute-audio'
-    ],
-    timeout: 90_000
-  };
-
-  if (PROXY_ENABLED && process.env.PROXY_HOST && process.env.PROXY_PORT) {
-    const proto = (process.env.PROXY_HOST || '').startsWith('http') ? '' : 'http://';
-    common.proxy = {
-      server: `${proto}${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`,
-      username: process.env.PROXY_USERNAME || undefined,
-      password: process.env.PROXY_PASSWORD || undefined
-    };
-  }
-
-  const chromePath = findChromeSync();
-  let browserLabel = 'chromium';
-  let context;
-
-  if (chromePath) {
-    browserLabel = 'chrome (system)';
-    context = await chromium.launchPersistentContext(userDataDir, {
-      ...common,
-      executablePath: chromePath
-    });
-  } else if (BROWSER_ENV && BROWSER_ENV.toLowerCase().includes('chrome')) {
-    browserLabel = 'chrome-channel';
-    context = await chromium.launchPersistentContext(userDataDir, {
-      ...common,
-      channel: 'chrome'
-    });
-  } else {
-    // Fallback absoluto: chromium de Playwright (requiere npx playwright install)
-    context = await chromium.launchPersistentContext(userDataDir, { ...common });
-  }
-
-  const proxyLabel = PROXY_ENABLED ? 'on' : 'off';
-  log(`Browser in use: ${browserLabel} | headful: ${HEADFUL ? 'yes' : 'no'} | proxy:${proxyLabel}`);
-
-  return context;
-}
-
-async function passCloudflare(page, { timeoutMs = 120_000 } = {}) {
-  // Estrategia simple/robusta: esperar a "networkidle" y un pequeño colchón.
+// Oculta query params y tokens en logs
+function maskUrl(u) {
   try {
-    await page.waitForLoadState('domcontentloaded', { timeout: Math.min(30_000, timeoutMs) });
-    await page.waitForLoadState('networkidle', { timeout: Math.min(60_000, timeoutMs) });
-    await page.waitForTimeout(2_000);
+    const url = new URL(u);
+    return `${url.origin}${url.pathname}`;
   } catch {
-    throw new Error('Cloudflare guard did not finish in time');
+    return u;
   }
 }
 
-function maskUrl(url) {
-  if (!url) return '***';
-  try {
-    const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return '***';
-  }
+// Une base + partes sin perder subrutas del API (evita usar '/recurso' absoluto)
+function joinUrl(base, ...parts) {
+  const b = base.endsWith('/') ? base : base + '/';
+  const p = parts.map(s => String(s).replace(/^\/+|\/+$/g, '')).join('/');
+  return new URL(b + p).toString();
 }
 
-// ---------- API ----------
-async function fetchJSON(url, init = {}) {
-  const headers = { 'Content-Type': 'application/json', ...(init.headers || {}) };
-  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
-  const res = await fetch(url, { ...init, headers });
-  const text = await res.text();
+async function fetchJSON(url, opts = {}) {
+  const headers = Object.assign(
+    {
+      'Accept': 'application/json',
+    },
+    opts.headers || {}
+  );
+
+  if (opts.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  if (API_TOKEN) {
+    // Si tu API usa "X-API-KEY" en lugar de Bearer, cambia esta línea:
+    headers['Authorization'] = `Bearer ${API_TOKEN}`;
+  }
+
+  const res = await fetch(url, { ...opts, headers });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}: ${text}`);
+    const txt = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${res.statusText}: ${txt.slice(0, 1200)}`);
   }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Invalid JSON from ${maskUrl(url)}: ${text}`);
-  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  // Si no es JSON, devolvemos texto (por si el endpoint devuelve string plano)
+  return res.text();
 }
 
+// =======================
+// API: cola y reporte
+// =======================
 async function getQueue() {
-  const url = new URL('/queue', API_BASE);
+  const urlStr = joinUrl(API_BASE, 'queue');
+  const url = new URL(urlStr);
   url.searchParams.set('force', '1');
-  if (process.env.QUEUE_LIMIT) url.searchParams.set('limit', String(process.env.QUEUE_LIMIT));
+  if (QUEUE_LIMIT) url.searchParams.set('limit', String(QUEUE_LIMIT));
 
   log('API_BASE_URL: ***');
   log(`Fetching queue from API (GET): ${maskUrl(url.toString())}`);
 
   const data = await fetchJSON(url.toString());
-  if (!data || !Array.isArray(data.tramites)) {
+  // Acepta dos formatos: { tramites: [...] } o directamente [...]
+  const tramites = Array.isArray(data?.tramites) ? data.tramites :
+                   Array.isArray(data) ? data : [];
+  if (!Array.isArray(tramites)) {
     throw new Error('Queue payload missing "tramites" array');
   }
-  log(`Queue raw payload: ${JSON.stringify(data)}`);
-  log(`Queue size: ${data.tramites.length}`);
-  return data.tramites;
+  log(`Queue raw payload: ${JSON.stringify({ tramites: tramites.map(t => ({ tramite_id: t.tramite_id, receipt_number: t.receipt_number, fail_count: t.fail_count })) })}`);
+  log(`Queue size: ${tramites.length}`);
+  return tramites;
 }
 
-// Stubs para reportes; si ya tenías endpoints, reemplaza aquí:
 async function reportResult(tramiteId, payload) {
-  if (!API_BASE) return;
+  const url = joinUrl(API_BASE, 'results', String(tramiteId));
   try {
-    const url = new URL(`/results/${tramiteId}`, API_BASE).toString();
     await fetchJSON(url, { method: 'POST', body: JSON.stringify(payload) });
   } catch (e) {
-    log(`WARN reportResult failed: ${e.message}`);
+    terr(`Report failed for tramite_id=${tramiteId}: ${e.message}`);
   }
 }
 
-// ---------- Lógica de scraping por recibo ----------
-// Reemplaza el contenido de esta función por tu scraping real si lo necesitas.
-// Aquí solo dejamos una navegación de ejemplo + Cloudflare guard.
-async function runCheckForReceipt(page, receipt) {
-  // TODO: cambia a tu URL real:
-  const target = process.env.TARGET_URL || 'https://example.com/';
-  await page.goto(target, { waitUntil: 'load', timeout: 90_000 });
-
-  // Si hay Cloudflare, esperar a que termine:
-  await passCloudflare(page, { timeoutMs: 120_000 });
-
-  // TODO: aquí tu scraping real...
-  await page.waitForTimeout(1_000);
-
-  // Devuelve un objeto de ejemplo:
-  return {
-    receipt,
-    status: 'ok',
-    fetchedAt: new Date().toISOString()
-  };
+// =======================
+// Navegación / Playwright
+// =======================
+function buildProxyOption() {
+  if (!PROXY_ENABLED || PROXY_ENABLED === '0' || PROXY_ENABLED.toLowerCase() === 'false') return undefined;
+  if (!PROXY_HOST || !PROXY_PORT) return undefined;
+  const server = `http://${PROXY_HOST}:${PROXY_PORT}`;
+  const proxy = { server };
+  if (PROXY_USERNAME || PROXY_PASSWORD) {
+    proxy.username = PROXY_USERNAME || '';
+    proxy.password = PROXY_PASSWORD || '';
+  }
+  return proxy;
 }
 
-// ---------- Main ----------
+async function launchPersistent() {
+  const userDataDir = path.join(os.tmpdir(), 'pw-user-data');
+  const proxy = buildProxyOption();
+
+  const contextOptions = {
+    headless: !HEADFUL,
+    viewport: { width: 1280, height: 800 },
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-webgl',
+      '--autoplay-policy=user-gesture-required',
+    ],
+    proxy,
+  };
+
+  // Preferimos Chrome del sistema
+  if (BROWSER.includes('chrome')) {
+    contextOptions.channel = 'chrome';
+    // Fallback por si el canal no está disponible
+    if (!fs.existsSync('/usr/bin/google-chrome') && fs.existsSync('/usr/bin/google-chrome-stable')) {
+      contextOptions.executablePath = '/usr/bin/google-chrome-stable';
+    } else if (fs.existsSync('/usr/bin/google-chrome')) {
+      contextOptions.executablePath = '/usr/bin/google-chrome';
+    }
+  }
+
+  log(`Browser in use: ${BROWSER} | headful: ${HEADFUL ? 'yes' : 'no'} | proxy:${proxy ? 'on' : 'off'}`);
+  const ctx = await chromium.launchPersistentContext(userDataDir, contextOptions);
+  const page = await ctx.newPage();
+  page.on('console', msg => {
+    const type = msg.type();
+    if (type === 'warning') warn('[page.console]', msg.text());
+    else if (type === 'error') terr('[page.console]', msg.text());
+    else log('[page.console]', msg.text());
+  });
+  return { ctx, page };
+}
+
+// Intento simple de esperar un posible reto de Cloudflare
+async function waitCloudflare(page, timeoutMs = 120000) {
+  const start = Date.now();
+  const cfHints = [
+    'challenge-platform',
+    'cf-chl-widget',
+    'cf-browser-verification',
+    'Checking your browser',
+    'Verifying you are human',
+  ];
+  try {
+    // Si se ve alguno de los hints, esperamos navegación o desaparición
+    while (Date.now() - start < timeoutMs) {
+      const content = (await page.content().catch(() => '')) || '';
+      const seen = cfHints.some(h => content.includes(h));
+      if (!seen) return; // no hay reto visible
+      await page.waitForTimeout(1000);
+      // si en el proceso cambia la URL o carga nueva página
+      if (page.url().includes('error')) break;
+    }
+  } catch {
+    /* ignore */
+  }
+  if (Date.now() - start >= timeoutMs) {
+    throw new Error('Cloudflare guard did not finish in time');
+  }
+}
+
+// =======================
+// Scrape (simplificado, robusto ante cambios)
+// =======================
+async function checkCase(page, receiptNumber) {
+  // Página de estado de caso USCIS (puede variar, mantenemos robusto)
+  const landing = 'https://egov.uscis.gov/casestatus/landing.do';
+  await page.goto(landing, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // Espera reto si aparece
+  await waitCloudflare(page, 120000).catch(err => { throw err; });
+
+  // Intenta localizar el input del receipt (varía de vez en cuando)
+  const selectors = [
+    'input#receipt_number',
+    'input[name="appReceiptNum"]',
+    'input[name="receipt_number"]',
+    'input[aria-label*="Receipt"]',
+    'input[type="text"]',
+  ];
+
+  let filled = false;
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.fill(receiptNumber, { timeout: 15000 });
+      filled = true;
+      break;
+    }
+  }
+  if (!filled) throw new Error('No se encontró el campo del Receipt Number');
+
+  // Click en botón de consulta
+  const buttonSelectors = [
+    'button:has-text("Check Status")',
+    'input[type="submit"]',
+    'button[type="submit"]',
+    'button:has-text("Check")',
+  ];
+
+  let clicked = false;
+  for (const sel of buttonSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await el.click({ timeout: 15000 });
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) {
+    // Si no hay botón, intenta Enter
+    await page.keyboard.press('Enter');
+  }
+
+  await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+  await waitCloudflare(page, 120000).catch(err => { throw err; });
+
+  // Extraer resultado (selector defensivo)
+  const resultSelectors = [
+    '.rows.text-center .current-status-sec h1',
+    '.text-center h1',
+    'h1.current-status-title',
+    'h1',
+    '[data-testid="case-status"]',
+  ];
+
+  for (const sel of resultSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      const title = (await el.textContent())?.trim() || '';
+      if (title) {
+        // También intenta obtener el párrafo de detalle
+        const detailSel = [
+          '.rows.text-center .rows.text-center',
+          '.text-center p',
+          'p',
+          '[data-testid="case-status-body"]',
+        ];
+        let body = '';
+        for (const ds of detailSel) {
+          const d = await page.$(ds);
+          if (d) {
+            body = (await d.textContent())?.trim() || '';
+            if (body) break;
+          }
+        }
+        return { title, body };
+      }
+    }
+  }
+
+  throw new Error('No se pudo extraer el estado del caso');
+}
+
+function safeName(s) {
+  return String(s).replace(/[^a-z0-9._-]+/gi, '_').slice(0, 80);
+}
+
+// =======================
+// Main
+// =======================
 async function main() {
   log('--- Scraping Cycle Started ---');
-
   if (!API_BASE) {
-    throw new Error('API_BASE (o API_BASE_URL) no está definido en el entorno.');
+    throw new Error('Falta API_BASE; configúralo como secret/API_BASE en el workflow.');
   }
 
-  let context;
-  const successes = [];
+  const tramites = await getQueue();
+
+  if (!tramites.length) {
+    log('No items in queue. Finishing.');
+    return;
+  }
+
+  const { ctx, page } = await launchPersistent();
+  let okCount = 0;
   const failures = [];
 
   try {
-    const queue = await getQueue();
+    for (const item of tramites) {
+      const { tramite_id, receipt_number } = item;
+      if (!tramite_id || !receipt_number) {
+        warn('Elemento inválido en cola:', item);
+        continue;
+      }
 
-    context = await createBrowserContext();
-
-    // Para ver consola del sitio en logs:
-    context.on('page', (p) => {
-      p.on('console', (msg) => {
-        // Imita el formato de tus logs: [page.console] <type> <text>
-        console.log(`[${ts()}] [page.console] ${msg.type()} ${msg.text()}`);
-      });
-    });
-
-    for (const item of queue) {
-      const receipt = item.receipt_number || item.receipt || '';
-      const id = item.tramite_id ?? item.id ?? null;
-      if (!receipt) continue;
-
-      log(`Processing: ${receipt}`);
-      const page = await context.newPage();
-
+      log(`Processing: ${receipt_number}`);
       try {
-        const result = await runCheckForReceipt(page, receipt);
-        successes.push({ id, receipt, result });
-      } catch (err) {
-        log(`FAIL ${receipt}: ${err.message} — ${err.message}`);
-        failures.push({ id, receipt, error: err.message });
-      } finally {
-        await page.close().catch(() => {});
+        const result = await checkCase(page, receipt_number);
+
+        // screenshot
+        const shotPath = path.join(SHOT_DIR, `${safeName(receipt_number)}_${Date.now()}.png`);
+        await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
+
+        await reportResult(tramite_id, {
+          ok: true,
+          receipt_number,
+          title: result.title,
+          body: result.body,
+          screenshot: path.basename(shotPath),
+          meta: { node: process.version, headful: HEADFUL, browser: BROWSER, env: NODE_ENV },
+        });
+
+        okCount += 1;
+      } catch (e) {
+        terr(`${receipt_number} failed: ${e.message}`);
+
+        // screenshot on failure
+        const shotPath = path.join(SHOT_DIR, `${safeName(receipt_number)}_${Date.now()}_ERR.png`);
+        await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
+
+        await reportResult(tramite_id, {
+          ok: false,
+          receipt_number,
+          error: e.message,
+          screenshot: path.basename(shotPath),
+          meta: { node: process.version, headful: HEADFUL, browser: BROWSER, env: NODE_ENV },
+        });
+
+        failures.push({ receipt_number, error: e.message });
       }
     }
   } finally {
-    if (context) await context.close().catch(() => {});
+    await ctx.close().catch(() => {});
   }
 
-  if (successes.length === 0) {
+  if (!okCount) {
     log('No successful scrapes to report.');
-  } else {
-    log(`Reporting successful items: ${successes.length}`);
   }
-  if (failures.length > 0) {
+  if (failures.length) {
     log(`Reporting failed items: ${failures.length}`);
   }
-
-  // Envía resultados (si tienes endpoints definidos, ajusta aquí)
-  for (const s of successes) {
-    if (s.id != null) await reportResult(s.id, { ok: true, data: s.result });
-  }
-  for (const f of failures) {
-    if (f.id != null) await reportResult(f.id, { ok: false, error: f.error });
-  }
-
   log('--- Scraping Cycle Finished ---');
 }
 
-// Manejo de errores global
-process.on('unhandledRejection', (err) => {
-  const message = err && err.message ? err.message : String(err);
-  log(`UNHANDLED REJECTION: ${message}`);
+// Run
+main().catch(err => {
+  terr(err.stack || err.message || String(err));
   process.exitCode = 1;
-});
-process.on('uncaughtException', (err) => {
-  const message = err && err.message ? err.message : String(err);
-  log(`UNCAUGHT EXCEPTION: ${message}`);
-  process.exitCode = 1;
-});
-
-main().catch((err) => {
-  log(err.stack || err.message || String(err));
-  process.exit(1);
 });
