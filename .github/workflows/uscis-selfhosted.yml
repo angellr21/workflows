@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # Ajustes del navegador/Playwright
+      # Playwright/Navegador
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       BROWSER: 'chrome-channel'
       HEADFUL: '1'
@@ -25,7 +25,7 @@ jobs:
       PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
       # API
-      API_BASE:  ${{ secrets.API_BASE }}   # ej: https://aroeservices.com/api
+      API_BASE:  ${{ secrets.API_BASE }}   # por ej: https://aroeservices.com/api
       API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
@@ -46,9 +46,20 @@ jobs:
           which google-chrome || which google-chrome-stable || true
           google-chrome --version || google-chrome-stable --version || true
 
-      - name: Run checker (Xvfb)
+      - name: Run checker (Xvfb) con reintentos
+        env:
+          NAV_TIMEOUT_MS: '90000'   # 90s p/ redes lentas
         run: |
-          xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs
+          set -e
+          for i in 1 2 3; do
+            echo ">>> Intento $i"
+            xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs && break || {
+              code=$?
+              echo "Intento $i falló (exit $code); esperando $((i*20))s…"
+              sleep $((i*20))
+              if [ $i -eq 3 ]; then exit $code; fi
+            }
+          done
 
       - name: Upload logs & report
         if: always()
