@@ -1,67 +1,60 @@
-name: USCIS Check (Self-hosted)
+name: USCIS Check (self-hosted)
 
 on:
   workflow_dispatch:
-    inputs:
-      limit:
-        description: "Cantidad máx. a procesar (opcional)"
-        required: false
-        default: "10"
+  schedule:
+    - cron: '*/30 * * * *' # cada 30 minutos (ajústalo a gusto)
 
 jobs:
   run-check:
-    # corre en tu runner propio (Linux, X64). Si agregaste labels extra, añádelos aquí.
     runs-on: self-hosted
+    timeout-minutes: 20
 
     env:
-      # === Tus credenciales/ajustes desde Secrets del repo ===
-      API_BASE: ${{ secrets.API_BASE }}
+      # Ajustes del navegador/Playwright
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      BROWSER: 'chrome-channel'
+      HEADFUL: '1'
+      NODE_ENV: 'production'
+
+      # Proxy (opcional)
+      PROXY_ENABLED: ${{ secrets.PROXY_ENABLED }}
+      PROXY_HOST:    ${{ secrets.PROXY_HOST }}
+      PROXY_PORT:    ${{ secrets.PROXY_PORT }}
+      PROXY_USERNAME:${{ secrets.PROXY_USERNAME }}
+      PROXY_PASSWORD:${{ secrets.PROXY_PASSWORD }}
+
+      # API
+      API_BASE:  ${{ secrets.API_BASE }}   # por ej: https://aroeservices.com/api
       API_TOKEN: ${{ secrets.API_TOKEN }}
-      PROXY_ENABLED: ${{ secrets.PROXY_ENABLED }}   # déjalo vacío o "0" si no usarás proxy
-      PROXY_HOST: ${{ secrets.PROXY_HOST }}
-      PROXY_PORT: ${{ secrets.PROXY_PORT }}
-      PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
-      PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-      # === Opciones del script (ajústalas si tu script las lee) ===
-      HEADFUL: "1"
-      BROWSER: "chrome-channel"    # tu script ya usa Chrome channel
-      NODE_ENV: production
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20 + cache npm
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Instalar dependencias (sin bajar navegadores)
+      - name: Install deps
         run: npm ci
-        env:
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"   # evita que Playwright intente bajar Chromium/FF/WebKit
 
-      - name: Verificar Google Chrome del sistema
+      - name: Show Chrome version (del sistema)
         run: |
           which google-chrome || which google-chrome-stable || true
-          google-chrome --version
+          google-chrome --version || google-chrome-stable --version || true
 
-      # IMPORTANTE: No hay pasos con "playwright install-deps" ni "sudo".
-      # Usamos el Chrome del sistema vía channel 'chrome' desde tu script.
-
-      - name: Ejecutar scraping con Xvfb
+      - name: Run checker (Xvfb)
         run: |
           xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs
-        # Si prefieres usar el script de package.json:
-        # run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
 
-      - name: Subir logs (si existen)
+      - name: Upload logs & report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-logs
+          name: logs-and-report
           path: |
             logs/**
             *.log
