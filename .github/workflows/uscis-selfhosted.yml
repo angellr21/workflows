@@ -8,16 +8,16 @@ on:
 jobs:
   run-check:
     runs-on: self-hosted
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     env:
-      # Playwright/Navegador
+      # Playwright/Chrome (usamos Chrome del sistema del runner)
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       BROWSER: 'chrome-channel'
       HEADFUL: '1'
       NODE_ENV: 'production'
 
-      # Proxy (opcional)
+      # Proxy (opcional, deja vacío si no usas)
       PROXY_ENABLED: ${{ secrets.PROXY_ENABLED }}
       PROXY_HOST:    ${{ secrets.PROXY_HOST }}
       PROXY_PORT:    ${{ secrets.PROXY_PORT }}
@@ -25,8 +25,11 @@ jobs:
       PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
       # API
-      API_BASE:  ${{ secrets.API_BASE }}   # por ej: https://aroeservices.com/api
+      API_BASE:  ${{ secrets.API_BASE }}    # p.ej. https://aroeservices.com/api
       API_TOKEN: ${{ secrets.API_TOKEN }}
+      # Estas 2 son opcionales: si no las defines, el script usa /queue y /result
+      API_QUEUE_PATH:  ${{ secrets.API_QUEUE_PATH }}
+      API_RESULT_PATH: ${{ secrets.API_RESULT_PATH }}
 
     steps:
       - name: Checkout
@@ -46,20 +49,10 @@ jobs:
           which google-chrome || which google-chrome-stable || true
           google-chrome --version || google-chrome-stable --version || true
 
-      - name: Run checker (Xvfb) con reintentos
-        env:
-          NAV_TIMEOUT_MS: '90000'   # 90s p/ redes lentas
+      - name: Run checker (Xvfb)
         run: |
           set -e
-          for i in 1 2 3; do
-            echo ">>> Intento $i"
-            xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs && break || {
-              code=$?
-              echo "Intento $i falló (exit $code); esperando $((i*20))s…"
-              sleep $((i*20))
-              if [ $i -eq 3 ]; then exit $code; fi
-            }
-          done
+          xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs
 
       - name: Upload logs & report
         if: always()
@@ -70,4 +63,6 @@ jobs:
             logs/**
             *.log
             playwright-report/**
+            screenshots/**
+            pages/**
           if-no-files-found: ignore
