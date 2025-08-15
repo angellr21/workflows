@@ -1,0 +1,57 @@
+name: USCIS Check (Self-hosted)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"  # corre cada 30 min; ajusta a tu gusto
+
+concurrency:
+  group: uscis-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-check:
+    runs-on: [self-hosted, Linux, X64]   # ← tu runner de WSL
+    timeout-minutes: 30
+
+    env:
+      NODE_ENV: production
+      PLAYWRIGHT_BROWSERS_PATH: 0
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1   # ya instalaste Google Chrome en WSL
+      API_BASE_URL: ${{ secrets.API_BASE_URL }}
+      API_TOKEN: ${{ secrets.API_TOKEN }}   # borra esta línea si no lo usas
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Show versions
+        run: |
+          node -v
+          npm -v
+          google-chrome --version || true
+
+      - name: Install deps
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm i
+          fi
+
+      - name: Install Playwright (chrome channel)
+        run: |
+          npx playwright install --with-deps chrome || true
+
+      - name: Run check (headful + Xvfb)
+        run: |
+          xvfb-run -s "-screen 0 1366x768x24" -a npm run check
