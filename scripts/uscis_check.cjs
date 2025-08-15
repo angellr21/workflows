@@ -2,15 +2,13 @@
 /* eslint-disable no-console */
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright'); // instalada vía npm
+const { chromium } = require('playwright');
 
-// -------------------- util de log --------------------
 function ts() { return new Date().toISOString(); }
 function log(...a) { console.log(`[${ts()}]`, ...a); }
 function warn(...a) { console.warn(`[${ts()}] [warn]`, ...a); }
 function err(...a) { console.error(`[${ts()}] [error]`, ...a); }
 
-// -------------------- config --------------------
 const CFG = {
   API_BASE: (process.env.API_BASE || '').replace(/\/+$/, ''),
   API_TOKEN: process.env.API_TOKEN || '',
@@ -32,23 +30,22 @@ const CFG = {
 };
 
 if (!CFG.API_BASE) {
-  err('API_BASE no definido. Exporta el secreto API_BASE.');
+  err('API_BASE no definido. Configura el secreto API_BASE.');
   process.exit(1);
 }
 
-const OUT_DIRS = ['logs', 'screenshots', 'pages', 'playwright-report'];
-for (const d of OUT_DIRS) fs.mkdirSync(d, { recursive: true });
+for (const d of ['logs', 'screenshots', 'pages', 'playwright-report']) {
+  fs.mkdirSync(d, { recursive: true });
+}
 
-// -------------------- helpers HTTP --------------------
 async function fetchJSON(url, options = {}) {
   const headers = {
     'content-type': 'application/json',
     ...(options.headers || {})
   };
-  // Incluye token si existe
   if (CFG.API_TOKEN) {
     headers['Authorization'] = `Bearer ${CFG.API_TOKEN}`;
-    headers['X-API-TOKEN'] = CFG.API_TOKEN; // por compatibilidad
+    headers['X-API-TOKEN'] = CFG.API_TOKEN;
   }
   const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
@@ -59,18 +56,14 @@ async function fetchJSON(url, options = {}) {
   return ct.includes('application/json') ? res.json() : res.text();
 }
 
-function qURL(pathname) {
-  return `${CFG.API_BASE}${pathname}`;
-}
+function qURL(p) { return `${CFG.API_BASE}${p}`; }
 
-// Probador de varios endpoints de resultado (por el 404 que muestras)
 async function postResultWithFallback(payload) {
   const candidates = [
-    CFG.RESULT_PATH,               // p.ej. /result        (por defecto)
-    '/uscis/result',               // alternativa común
-    '/api/uscis/result'            // la que aparece en tu 404
+    CFG.RESULT_PATH,
+    '/uscis/result',
+    '/api/uscis/result'
   ];
-
   let lastErr;
   for (const p of candidates) {
     try {
@@ -84,10 +77,8 @@ async function postResultWithFallback(payload) {
         },
         body: JSON.stringify(payload)
       });
-      if (res.ok || res.status === 204) {
-        return true;
-      }
-      const txt = await res.text();
+      if (res.ok || res.status === 204) return true;
+      const txt = await res.text().catch(() => '');
       throw new Error(`HTTP ${res.status} ${res.statusText}: ${txt.slice(0, 1500)}`);
     } catch (e) {
       lastErr = e;
@@ -97,23 +88,20 @@ async function postResultWithFallback(payload) {
   throw lastErr;
 }
 
-// -------------------- Playwright setup --------------------
 async function locateChrome() {
-  const candidates = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable'];
-  for (const p of candidates) {
+  for (const p of ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable']) {
     if (fs.existsSync(p)) return p;
   }
   return null;
 }
 
 function randomUA() {
-  // UA "normal" de escritorio (Chrome en Windows)
   const ver =  119 + Math.floor(Math.random() * 20);
   return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${ver}.0.0.0 Safari/537.36`;
 }
 
-// -------------------- USCIS scraping --------------------
-const USCIS_URL = 'https://egov.uscis.gov/casestatus/landing.do';
+const USCIS_LANDING = 'https://egov.uscis.gov/casestatus/landing.do';
+const USCIS_MYCASE  = 'https://egov.uscis.gov/casestatus/mycasestatus.do';
 
 const RECEIPT_INPUTS = [
   'input[name="appReceiptNum"]',
@@ -130,6 +118,13 @@ const SUBMIT_BUTTONS = [
   'button:has-text("Check Status")'
 ].join(', ');
 
+const RESULT_SELECTORS = [
+  'h1:has-text("Case ")',
+  '.current-status-sec',
+  '.rows .text-center h1',
+  'div:has-text("Your Current Case Status")'
+];
+
 const BLOCK_MARKERS = [
   'text=Access denied',
   'text=Attention Required! | Cloudflare',
@@ -139,82 +134,101 @@ const BLOCK_MARKERS = [
 ];
 
 async function saveArtifacts(prefix, page) {
-  try {
-    const html = await page.content();
-    fs.writeFileSync(path.join('pages', `${prefix}.html`), html, 'utf8');
-  } catch {}
-  try {
-    await page.screenshot({ path: path.join('screenshots', `${prefix}.png`), fullPage: true });
-  } catch {}
+  try { fs.writeFileSync(path.join('pages', `${prefix}.html`), await page.content(), 'utf8'); } catch {}
+  try { await page.screenshot({ path: path.join('screenshots', `${prefix}.png`), fullPage: true }); } catch {}
 }
 
 async function openContext() {
   const executablePath = await locateChrome();
-  const args = [
-    '--no-sandbox',
-    '--disable-gpu',
-    '--disable-dev-shm-usage',
-    '--disable-blink-features=AutomationControlled',
-    '--force-color-profile=srgb'
-  ];
-
-  const context = await chromium.launchPersistentContext(
+  const ctx = await chromium.launchPersistentContext(
     path.join('.pw-profile'),
     {
       headless: !CFG.HEADFUL ? true : false,
-      channel: executablePath ? undefined : 'chrome', // si no hay binario, usa channel
+      channel: executablePath ? undefined : 'chrome',
       executablePath: executablePath || undefined,
-      args,
+      args: [
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--force-color-profile=srgb'
+      ],
       viewport: { width: 1366, height: 768 },
       locale: 'en-US',
+      timezoneId: 'America/New_York',
       colorScheme: 'light',
       userAgent: randomUA(),
       proxy: CFG.PROXY?.server ? {
-        server: CFG.PROXY.server,
-        username: CFG.PROXY.username,
-        password: CFG.PROXY.password
-      } : undefined,
+        server: CFG.PROXY.server, username: CFG.PROXY.username, password: CFG.PROXY.password
+      } : undefined
     }
   );
 
-  // "stealth" básico
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    // WebGL/Plugins mínimos
-    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+  await ctx.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'DNT': '1',
+    'Upgrade-Insecure-Requests': '1'
   });
 
-  const page = await context.newPage();
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+    try {
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(p){ if (p===37445) return 'NVIDIA'; return getParameter.apply(this,[p]); };
+    } catch {}
+  });
+
+  const page = await ctx.newPage();
   page.setDefaultNavigationTimeout(CFG.NAV_TIMEOUT_MS);
   page.setDefaultTimeout(CFG.SELECTOR_TIMEOUT_MS);
-  return { context, page };
+  return { context: ctx, page };
+}
+
+// ---- FAST PATH: ir directo al resultado con querystring ----
+async function tryDirectResult(page, receipt, attempt) {
+  const url = `${USCIS_MYCASE}?appReceiptNum=${encodeURIComponent(receipt)}`;
+  const resp = await page.goto(url, { waitUntil: 'domcontentloaded' });
+  const status = resp ? resp.status() : 0;
+
+  // ¿bloqueado?
+  const blocked = await Promise.any(BLOCK_MARKERS.map(sel => page.waitForSelector(sel, { timeout: 4000 })))
+    .then(() => true).catch(() => false);
+
+  if (blocked || status >= 400) {
+    await saveArtifacts(`blocked_direct_${receipt}_attempt${attempt}`, page);
+    throw new Error(`Bloqueo/HTTP ${status} en acceso directo`);
+  }
+
+  const found = await Promise.any(RESULT_SELECTORS.map(sel => page.waitForSelector(sel, { timeout: 8000 })))
+    .catch(() => null);
+
+  if (found) {
+    return true;
+  } else {
+    // No encontró el bloque, no necesariamente bloqueo. Devuelve false para intentar el flujo de formulario.
+    return false;
+  }
 }
 
 async function ensureReady(page, attempt) {
-  // Abre y espera a input o marca de bloqueo
-  await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' });
+  await page.goto(USCIS_LANDING, { waitUntil: 'domcontentloaded' });
 
-  // Corre una "carrera" entre: selector de recibo, bloqueos, o 10s y luego intenta la ruta "mycasestatus"
-  const blocker = Promise.any(BLOCK_MARKERS.map(sel => page.waitForSelector(sel, { timeout: 8_000 })))
-    .then(() => 'blocked')
-    .catch(() => null);
+  const blocker = Promise.any(BLOCK_MARKERS.map(sel => page.waitForSelector(sel, { timeout: 8000 })))
+    .then(() => 'blocked').catch(() => null);
 
-  const receipt = page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 12_000 })
-    .then(() => 'ok')
-    .catch(() => null);
+  const receipt = page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 12000 })
+    .then(() => 'ok').catch(() => null);
 
-  let outcome = await Promise.race([blocker, receipt, new Promise(r => setTimeout(() => r('timeout'), 10_000))]);
+  let outcome = await Promise.race([blocker, receipt, new Promise(r => setTimeout(() => r('timeout'), 10000))]);
 
   if (outcome === 'blocked' || outcome === 'timeout') {
-    // plan B: otra ruta conocida
-    await page.goto('https://egov.uscis.gov/casestatus/mycasestatus.do', { waitUntil: 'domcontentloaded' });
+    await page.goto(USCIS_MYCASE, { waitUntil: 'domcontentloaded' });
     try {
-      await page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 15_000 });
+      await page.waitForSelector(RECEIPT_INPUTS, { state: 'visible', timeout: 15000 });
       outcome = 'ok';
-    } catch {
-      outcome = outcome || 'blocked';
-    }
+    } catch { outcome = outcome || 'blocked'; }
   }
 
   if (outcome !== 'ok') {
@@ -224,32 +238,32 @@ async function ensureReady(page, attempt) {
 }
 
 async function checkCase(page, receipt, attempt) {
+  // 1) Intento directo con querystring
+  try {
+    const ok = await tryDirectResult(page, receipt, attempt);
+    if (ok) {
+      const title = (await page.locator('h1').first().textContent().catch(()=>'')||'').trim();
+      const body = (await page.locator('div, p').allTextContents().catch(()=>[])).join('\n').slice(0,5000);
+      return { receipt_number: receipt, status_title: title, status_excerpt: body };
+    }
+  } catch (e) {
+    warn(`Directo falló (${receipt}): ${e.message}`);
+  }
+
+  // 2) Flujo por formulario
   await ensureReady(page, attempt);
 
   const input = page.locator(RECEIPT_INPUTS).first();
   await input.fill('');
   await input.type(receipt, { delay: 30 });
 
-  const beforeNav = page.url();
-  // dispara: algunos sitios usan submit del form
   const btn = page.locator(SUBMIT_BUTTONS).first();
-  if (await btn.isVisible().catch(() => false)) {
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded'),
-      btn.click()
-    ]);
+  if (await btn.isVisible().catch(()=>false)) {
+    await Promise.all([page.waitForLoadState('domcontentloaded'), btn.click()]);
   } else {
     await page.keyboard.press('Enter');
     await page.waitForLoadState('domcontentloaded');
   }
-
-  // Espera alguno de los contenedores de resultado conocidos:
-  const RESULT_SELECTORS = [
-    'h1:has-text("Case ")',              // "Case Was Received", etc.
-    '.current-status-sec',               // contenedor clásico
-    '.rows .text-center h1',             // variaciones
-    'div:has-text("Your Current Case Status")'
-  ];
 
   const found = await Promise.any(
     RESULT_SELECTORS.map(sel => page.waitForSelector(sel, { timeout: CFG.SELECTOR_TIMEOUT_MS }))
@@ -260,19 +274,12 @@ async function checkCase(page, receipt, attempt) {
     throw new Error('No se detectó el bloque de resultado');
   }
 
-  // Extrae resumen
-  const titleNode = await page.locator('h1').first();
-  const title = (await titleNode.textContent().catch(() => '') || '').trim();
-  const body = (await page.locator('div, p').allTextContents().catch(() => [])).join('\n').slice(0, 5000);
+  const title = (await page.locator('h1').first().textContent().catch(()=>'')||'').trim();
+  const body  = (await page.locator('div, p').allTextContents().catch(()=>[])).join('\n').slice(0,5000);
 
-  return {
-    receipt_number: receipt,
-    status_title: title,
-    status_excerpt: body
-  };
+  return { receipt_number: receipt, status_title: title, status_excerpt: body };
 }
 
-// -------------------- flujo principal --------------------
 async function getQueue() {
   const url = qURL(CFG.QUEUE_PATH);
   log(`Fetching queue from API (GET): ${url}`);
@@ -293,10 +300,7 @@ async function main() {
   log(`API_BASE_URL: ${CFG.API_BASE}`);
 
   const queue = await getQueue();
-  if (!queue.length) {
-    log('No hay elementos en la cola. Fin.');
-    return;
-  }
+  if (!queue.length) { log('Cola vacía.'); return; }
 
   const { context, page } = await openContext();
   log(`Browser in use: ${CFG.BROWSER} | headful: ${CFG.HEADFUL ? 'yes' : 'no'} | proxy:${CFG.PROXY ? 'on' : 'off'}`);
@@ -307,6 +311,7 @@ async function main() {
 
     let result = null;
     let ok = false;
+
     for (let attempt = 1; attempt <= CFG.MAX_ATTEMPTS_CASE; attempt++) {
       try {
         result = await checkCase(page, receipt_number, attempt);
@@ -314,31 +319,18 @@ async function main() {
         break;
       } catch (e) {
         err(`${receipt_number} failed: ${e.message}`);
-        // backoff progresivo
-        await new Promise(r => setTimeout(r, 3000 * attempt));
-        // recarga dura entre intentos
-        try { await page.goto(USCIS_URL, { waitUntil: 'domcontentloaded' }); } catch {}
+        await new Promise(r => setTimeout(r, 2500 * attempt));
+        try { await page.goto(USCIS_LANDING, { waitUntil: 'domcontentloaded' }); } catch {}
       }
     }
 
-    // arma payload y envía
-    const payload = {
-      tramite_id,
-      receipt_number,
-      ok,
-      ...(result || {}),
-      ts: new Date().toISOString()
-    };
-
-    try {
-      await postResultWithFallback(payload);
-    } catch (e) {
-      warn(`POST ${qURL(CFG.RESULT_PATH)} falló: ${e.message}`);
-    }
+    const payload = { tramite_id, receipt_number, ok, ...(result || {}), ts: new Date().toISOString() };
+    try { await postResultWithFallback(payload); }
+    catch (e) { warn(`POST ${qURL(CFG.RESULT_PATH)} falló: ${e.message}`); }
   }
 
-  await page.close().catch(() => {});
-  await context.close().catch(() => {});
+  await page.close().catch(()=>{});
+  await context.close().catch(()=>{});
 }
 
 main().catch(async (e) => {
