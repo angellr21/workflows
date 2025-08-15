@@ -3,7 +3,7 @@ name: USCIS Check (self-hosted)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *' # cada 30 minutos (ajústalo a gusto)
+    - cron: '*/30 * * * *' # cada 30 minutos
 
 jobs:
   run-check:
@@ -21,11 +21,11 @@ jobs:
       PROXY_ENABLED: ${{ secrets.PROXY_ENABLED }}
       PROXY_HOST:    ${{ secrets.PROXY_HOST }}
       PROXY_PORT:    ${{ secrets.PROXY_PORT }}
-      PROXY_USERNAME:${{ secrets.PROXY_USERNAME }}
-      PROXY_PASSWORD:${{ secrets.PROXY_PASSWORD }}
+      PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+      PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
       # API
-      API_BASE:  ${{ secrets.API_BASE }}   # por ej: https://aroeservices.com/api
+      API_BASE:  ${{ secrets.API_BASE }}   # ej: https://aroeservices.com/api
       API_TOKEN: ${{ secrets.API_TOKEN }}
 
     steps:
