@@ -2,29 +2,68 @@ name: USCIS Check (Self-hosted)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
+    inputs:
+      limit:
+        description: "Cantidad máx. a procesar (opcional)"
+        required: false
+        default: "10"
 
 jobs:
   run-check:
-    runs-on: [self-hosted, Linux, X64]  # apunta al runner que tienes
+    # corre en tu runner propio (Linux, X64). Si agregaste labels extra, añádelos aquí.
+    runs-on: self-hosted
+
+    env:
+      # === Tus credenciales/ajustes desde Secrets del repo ===
+      API_BASE: ${{ secrets.API_BASE }}
+      API_TOKEN: ${{ secrets.API_TOKEN }}
+      PROXY_ENABLED: ${{ secrets.PROXY_ENABLED }}   # déjalo vacío o "0" si no usarás proxy
+      PROXY_HOST: ${{ secrets.PROXY_HOST }}
+      PROXY_PORT: ${{ secrets.PROXY_PORT }}
+      PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+      PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+      # === Opciones del script (ajústalas si tu script las lee) ===
+      HEADFUL: "1"
+      BROWSER: "chrome-channel"    # tu script ya usa Chrome channel
+      NODE_ENV: production
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js 20 + cache npm
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "20.x"
           cache: "npm"
+          cache-dependency-path: package-lock.json
 
-      - name: Instalar dependencias del proyecto
+      - name: Instalar dependencias (sin bajar navegadores)
         run: npm ci
-
-      # Si tu código usa canal "chrome", basta con esto:
-      - name: Instalar navegadores de Playwright
-        run: npx playwright install chrome
-
-      - name: Ejecutar el check con Xvfb
-        run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
         env:
-          API_BASE: ${{ secrets.API_BASE }}
-          API_TOKEN: ${{ secrets.API_TOKEN }}
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"   # evita que Playwright intente bajar Chromium/FF/WebKit
+
+      - name: Verificar Google Chrome del sistema
+        run: |
+          which google-chrome || which google-chrome-stable || true
+          google-chrome --version
+
+      # IMPORTANTE: No hay pasos con "playwright install-deps" ni "sudo".
+      # Usamos el Chrome del sistema vía channel 'chrome' desde tu script.
+
+      - name: Ejecutar scraping con Xvfb
+        run: |
+          xvfb-run -s "-screen 0 1366x768x24" -a node scripts/uscis_check.cjs
+        # Si prefieres usar el script de package.json:
+        # run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
+
+      - name: Subir logs (si existen)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: |
+            logs/**
+            *.log
+            playwright-report/**
+          if-no-files-found: ignore
