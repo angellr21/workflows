@@ -3,7 +3,7 @@ name: USCIS Case Checker
 on:
   workflow_dispatch:
   schedule:
-    # Corre cada hora
+    # Corre cada hora (ajústalo a tu gusto)
     - cron: "0 * * * *"
 
 concurrency:
@@ -23,7 +23,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20.x"
-          # Importante: no activar cache npm si no tienes package-lock.json
+          # No activamos cache de npm si no hay package-lock.json
           # cache: "npm"
 
       - name: Install dependencies
@@ -37,23 +37,50 @@ jobs:
       - name: Install Playwright (Chrome + system deps)
         run: npx playwright install --with-deps chrome
 
-      # Opcional: instala Chromium como fallback (puedes comentar esta línea si prefieres)
-      # - name: Install Playwright (Chromium fallback)
-      #   run: npx playwright install --with-deps chromium
+      - name: Ensure Google Chrome present
+        run: |
+          google-chrome --version || true
+          node -e "console.log('Playwright version:', require('playwright/package.json').version)"
 
-      - name: Run scraper (headful bajo Xvfb usando canal Chrome)
+      # ===== PROXY ES OBLIGATORIO PARA EVITAR CLOUDFLARE EN RUNNERS PÚBLICOS =====
+      - name: Validate required secrets (API & Proxy)
+        run: |
+          MISSING=0
+          [ -z "${{ secrets.API_BASE }}" ] && echo "::error::Missing secret API_BASE" && MISSING=1
+          [ -z "${{ secrets.API_TOKEN }}" ] && echo "::error::Missing secret API_TOKEN" && MISSING=1
+          [ -z "${{ secrets.PROXY_SERVER }}" ] && echo "::error::Missing secret PROXY_SERVER (e.g. http://host:port)" && MISSING=1
+          [ -z "${{ secrets.PROXY_USERNAME }}" ] && echo "::error::Missing secret PROXY_USERNAME" && MISSING=1
+          [ -z "${{ secrets.PROXY_PASSWORD }}" ] && echo "::error::Missing secret PROXY_PASSWORD" && MISSING=1
+          if [ "$MISSING" -eq 1 ]; then
+            echo "One or more required secrets are missing. Aborting."
+            exit 1
+          fi
+          echo "All required secrets present."
+
+      - name: Run scraper (Chrome headful bajo Xvfb + Proxy residencial)
         env:
+          # Backend
           API_BASE: ${{ secrets.API_BASE }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
+
+          # Parámetros funcionales del worker
           LIMIT: "10"
           FORCE: "1"
           HEADFUL: "1"
-          USE_CHROME: "1"    # fuerza el canal 'chrome' en el script
+          USE_CHROME: "1"
           DEBUG: "1"
+          CF_WAIT_MS: "180000"   # 3 min por item; el script puede tomar este hint si lo soporta
 
-          # Soporte de proxy (deja en blanco si no usas):
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          # Entorno más “humano”
+          TZ: "America/New_York"
+          LANG: "en_US.UTF-8"
+          LC_ALL: "en_US.UTF-8"
+
+          # Proxy residencial/ISP (requerido)
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}       # p.ej: http://host:port ó http://ip:port
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
-        run: xvfb-run -s "-screen 0 1366x768x24" -a npm run check
+        run: |
+          echo "Starting scraper with proxy enabled."
+          xvfb-run -s "-screen 0 1366x768x24" -a npm run check
