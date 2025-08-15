@@ -11,12 +11,15 @@
  *  4) Reporta: POST /report (éxitos) y POST /report-failed (errores)
  *
  * ENV:
- *  - API_BASE    (requerido)   e.g. https://mi-api.test/api/uscis
- *  - API_TOKEN   (opcional)    token Bearer
- *  - LIMIT       (opcional)    items por corrida (integer)
- *  - FORCE       (opcional)    fuerza uso de cola (?force=1 por defecto)
- *  - HEADFUL=1   (opcional)    Headful (UI) bajo Xvfb en GitHub Actions
- *  - DEBUG=1     (opcional)    logs adicionales
+ *  - API_BASE     (requerido)   e.g. https://mi-api.test/api/uscis
+ *  - API_TOKEN    (opcional)    token Bearer
+ *  - LIMIT        (opcional)    items por corrida (integer)
+ *  - FORCE        (opcional)    fuerza uso de cola (?force=1 por defecto)
+ *  - HEADFUL=1    (opcional)    Headful (UI) bajo Xvfb en GitHub Actions
+ *  - DEBUG=1      (opcional)    logs adicionales
+ *  - USE_CHROME=1 (opcional)    intenta usar canal 'chrome' (si está instalado)
+ *  - PROXY_SERVER (opcional)    e.g. http://host:port o http://user:pass@host:port
+ *  - PROXY_USERNAME / PROXY_PASSWORD (opcionales) credenciales si no van embebidas
  */
 
 const dns = require('dns');
@@ -32,8 +35,14 @@ const RAW_BASE   = (process.env.API_BASE || '').trim();
 const API_TOKEN  = process.env.API_TOKEN || '';
 const HEADFUL    = process.env.HEADFUL === '1';
 const DEBUG      = process.env.DEBUG === '1';
+const USE_CHROME = process.env.USE_CHROME === '1';
+
 const LIMIT      = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
 const FORCE      = (process.env.FORCE || '1').trim(); // por defecto ?force=1
+
+const PROXY_SERVER   = (process.env.PROXY_SERVER || '').trim();
+const PROXY_USERNAME = process.env.PROXY_USERNAME || '';
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || '';
 
 if (!RAW_BASE) {
   console.error('API_BASE is required.');
@@ -173,23 +182,63 @@ function makeUserDataDir() {
   return dir;
 }
 
+function buildProxyOption() {
+  if (!PROXY_SERVER) return undefined;
+
+  // Si las credenciales vienen embebidas en la URL, Playwright las toma solo con 'server'
+  const opt = { server: PROXY_SERVER };
+  // Si vienen separadas, agregamos usuario/clave
+  if (PROXY_USERNAME || PROXY_PASSWORD) {
+    opt.username = PROXY_USERNAME || undefined;
+    opt.password = PROXY_PASSWORD || undefined;
+  }
+  return opt;
+}
+
 async function launchPersistent() {
   const userDataDir = makeUserDataDir();
 
-  const context = await chromium.launchPersistentContext(userDataDir, {
+  const options = {
     headless: !HEADFUL,
     args: buildLaunchArgs(),
     ...buildContextOptions(),
-  });
+  };
+
+  const proxyOpt = buildProxyOption();
+  if (proxyOpt) options.proxy = proxyOpt;
+
+  let context;
+  let using = 'chromium-bundled';
+
+  try {
+    if (USE_CHROME) {
+      context = await chromium.launchPersistentContext(userDataDir, {
+        ...options,
+        channel: 'chrome', // requiere que 'chrome' esté instalado vía 'npx playwright install chrome'
+      });
+      using = 'chrome-channel';
+    } else {
+      context = await chromium.launchPersistentContext(userDataDir, options);
+    }
+  } catch (e) {
+    // Si falló el canal chrome, caemos a Chromium
+    if (USE_CHROME) {
+      log('Chrome channel requested but failed to launch; falling back to bundled Chromium.', e.message);
+      context = await chromium.launchPersistentContext(userDataDir, options);
+      using = 'chromium-bundled';
+    } else {
+      throw e;
+    }
+  }
 
   await applyStealth(context);
 
-  // Página a usar durante toda la corrida
   const page = context.pages()[0] || await context.newPage();
   page.setDefaultNavigationTimeout(120_000);
   page.setDefaultTimeout(60_000);
 
   if (DEBUG) {
+    log('Browser in use:', using, '| headful:', HEADFUL ? 'yes' : 'no', proxyOpt ? '| proxy:on' : '| proxy:off');
     page.on('console', msg => {
       const type = msg.type();
       if (type === 'warning' || type === 'error') {
@@ -238,11 +287,8 @@ async function passCloudflare(page, { maxWaitMs = 150_000 } = {}) {
       await page.mouse.move(200 + Math.random() * 300, 300 + Math.random() * 200, { steps: 3 });
     } catch {}
 
-    // Si no detectamos challenge visible, igualmente seguimos esperando hasta maxWaitMs
-    if (!cfOn) {
-      // pequeño respiro
-      await sleep(400);
-    }
+    // pequeño respiro si no hay señales claras
+    if (!cfOn) await sleep(400);
   }
   return false;
 }
